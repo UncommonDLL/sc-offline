@@ -274,7 +274,7 @@ only for the step that needs it:
 If the mod folder's `data` can't be written, the mod can't save your wallet or places, and the launcher tells
 you to move the folder (for example to your Desktop).
 
-Start `sc-offline.exe` with normal rights. An elevated launcher attempts to use the desktop token for the game; if unavailable, it falls back and warns. Remove *Run this program as an administrator* from `StarCitizen.exe` Properties to launch with normal rights. Startup megamap crash #109 remains under investigation; no OBS or elevation cause is established. Crash diagnostics identify the fault module/offset and raw-stack executable-address candidates, not an unwound call chain. Windows CI builds pass; v0.7.7 has not been run in game.
+Start `sc-offline.exe` with normal rights. An elevated launcher attempts to use the desktop token for the game; if unavailable, it falls back and warns. Remove *Run this program as an administrator* from `StarCitizen.exe` Properties to launch with normal rights. On NVIDIA GPUs, turn off **Smooth Motion** for Star Citizen in the NVIDIA App first; with it on, the game can crash during startup ([README troubleshooting](../README.md#troubleshooting)). Crash diagnostics identify the fault module/offset and raw-stack executable-address candidates, not an unwound call chain.
 
 ### Session logs
 

@@ -162,9 +162,15 @@ Say yes to the administrator prompt; some antivirus tools lock the hosts file.
 </details>
 
 <details>
+<summary><b>The game crashes while loading on an NVIDIA GPU</b></summary>
+
+Turn off **Smooth Motion** for Star Citizen in the NVIDIA App (Graphics → Program Settings → Star Citizen → Smooth Motion → Off), or in the global settings if you set it there. With Smooth Motion on, the game can crash during startup; `mod.log` then shows `[crash]` lines naming `NvPresent64.dll` or `nvcuda64.dll`. If it still crashes with Smooth Motion off, [report it](https://github.com/scubamount/sc-offline/issues) with matching `Game.log`, `mod.log` and `launcher.log`.
+</details>
+
+<details>
 <summary><b>The game closes by itself while loading</b></summary>
 
-Start `sc-offline.exe` with normal rights. An elevated launcher attempts to use the desktop token for the game; if unavailable, it falls back and warns. Remove *Run this program as an administrator* from `StarCitizen.exe` Properties to launch with normal rights. Startup megamap crash #109 remains under investigation; no OBS or elevation cause is established. Crash diagnostics identify the fault module/offset and raw-stack executable-address candidates, not an unwound call chain. Windows CI builds pass; v0.7.7 has not been run in game.
+Start `sc-offline.exe` with normal rights. An elevated launcher attempts to use the desktop token for the game; if unavailable, it falls back and warns. Remove *Run this program as an administrator* from `StarCitizen.exe` Properties to launch with normal rights. On NVIDIA GPUs, check Smooth Motion first (see above). Crash diagnostics identify the fault module/offset and raw-stack executable-address candidates, not an unwound call chain.
 </details>
 
 <details>
