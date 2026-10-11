@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.30)
+project(launcher_safety_tests LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+enable_testing()
+add_executable(safety_tests transaction_tests.cpp ../../launcher/safety/transaction.cpp)
+target_include_directories(safety_tests PRIVATE ../../launcher/safety)
+add_test(NAME safety_tests COMMAND safety_tests)
