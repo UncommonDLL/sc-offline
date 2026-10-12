@@ -27,4 +27,3 @@ int main() {
     std::filesystem::remove_all(dir);
     std::cout<<"journal corruption, atomic replacement, Unicode, identity tests passed\n";
 }
-

@@ -87,4 +87,3 @@ int main(int argc,char**) {
     if(!exit)std::cout<<"native file rollback, locked DLL, restart receipt tests passed\n";
     return exit;
 }
-
