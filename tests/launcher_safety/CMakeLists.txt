@@ -17,3 +17,11 @@ add_executable(recovery_tests recovery_tests.cpp ../../launcher/safety/windows_h
 target_include_directories(recovery_tests PRIVATE ../../launcher/safety)
 target_link_libraries(recovery_tests PRIVATE bcrypt ole32 oleaut32 advapi32 ws2_32 shell32)
 add_test(NAME recovery_tests COMMAND recovery_tests)
+add_executable(windows_integration_tests windows_integration_tests.cpp ../../launcher/safety/journal.cpp ../../launcher/safety/firewall.cpp)
+target_include_directories(windows_integration_tests PRIVATE ../../launcher/safety)
+target_link_libraries(windows_integration_tests PRIVATE bcrypt ole32 oleaut32 advapi32 ws2_32)
+# This changes rules for its own executable only; invoke explicitly with elevation.
+if(SCO_LAUNCHER_EXE)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME launcher_cli COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cli_tests.py ${SCO_LAUNCHER_EXE})
+endif()

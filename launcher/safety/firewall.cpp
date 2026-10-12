@@ -9,13 +9,14 @@
 #include <stdexcept>
 #include <cwctype>
 #include <functional>
+#include <source_location>
 
 namespace sco::safety {
 namespace {
 const wchar_t* Group=L"sc-offline verified isolation";
 std::wstring Ip(uint32_t v) { return std::to_wstring(v>>24)+L"."+std::to_wstring((v>>16)&255)+L"."+std::to_wstring((v>>8)&255)+L"."+std::to_wstring(v&255); }
 std::wstring Complement(const std::vector<uint32_t>& values,uint64_t end,bool address) {
-    std::wstring out; uint64_t next=address?0:1;
+    std::wstring out; uint64_t next=0;
     auto text=[&](uint64_t v){return address?Ip(static_cast<uint32_t>(v)):std::to_wstring(v);};
     auto add=[&](uint64_t a,uint64_t b){if(!out.empty()) out+=L","; out+=text(a); if(a!=b) out+=L"-"+text(b);};
     for(auto v:values) { if(v>next) add(next,v-1); next=static_cast<uint64_t>(v)+1; }
@@ -29,7 +30,8 @@ std::wstring Normalize(std::wstring v) {
     std::vector<std::wstring> items; std::wistringstream in(v); std::wstring item;
     while(std::getline(in,item,L',')) {
         // Firewall COM expands ::/0 into its textual /0 form on some Windows builds.
-        if(item.find(L':')!=item.npos && item.ends_with(L"/0")) item=L"::/0";
+        if(item.find(L':')!=item.npos) {auto slash=item.find(L'/');auto address=item.substr(0,slash);IN6_ADDR ip{};wchar_t canonical[64]{};if(InetPtonW(AF_INET6,address.c_str(),&ip)==1 && InetNtopW(AF_INET6,&ip,canonical,64))item=std::wstring(canonical)+(slash==item.npos?L"/128":item.substr(slash));}
+        if(item.find(L':')==item.npos && (item.ends_with(L"/255.255.255.255") || item.ends_with(L"/32")))item.resize(item.find(L'/'));
         items.push_back(item);
     }
     std::sort(items.begin(),items.end()); v.clear(); for(auto& x:items) { if(!v.empty()) v+=L","; v+=x; } return v;
@@ -42,7 +44,7 @@ struct Policy {
         if(FAILED(initialized) && initialized!=RPC_E_CHANGED_MODE) throw std::runtime_error("COM initialization failed");
         if(FAILED(CoCreateInstance(__uuidof(NetFwPolicy2),nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&policy.p))) || FAILED(policy->get_Rules(&rules.p))) throw std::runtime_error("firewall policy unavailable");
     }
-    ~Policy(){if(SUCCEEDED(initialized))CoUninitialize();}
+    ~Policy(){if(rules.p){rules.p->Release();rules.p=nullptr;}if(policy.p){policy.p->Release();policy.p=nullptr;}if(SUCCEEDED(initialized))CoUninitialize();}
     void Enforced() {
         SC_HANDLE manager=OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
         if(!manager) throw std::runtime_error("firewall service inspection failed");
@@ -62,7 +64,7 @@ struct Policy {
     }
 };
 bool Missing(HRESULT hr) { return hr==HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr==HRESULT_FROM_WIN32(ERROR_NOT_FOUND); }
-void Check(HRESULT hr) { if(FAILED(hr)) throw std::runtime_error("firewall COM operation failed"); }
+void Check(HRESULT hr,const std::source_location where=std::source_location::current()) { if(FAILED(hr)) {std::ostringstream s;s<<"firewall COM operation failed at line "<<where.line()<<", HRESULT 0x"<<std::hex<<static_cast<unsigned long>(hr);throw std::runtime_error(s.str());} }
 std::wstring GetString(INetFwRule* r,HRESULT (STDMETHODCALLTYPE INetFwRule::*getter)(BSTR*)) { BSTR b=nullptr; Check((r->*getter)(&b)); std::wstring s=b?b:L""; SysFreeString(b); return s; }
 void Verify(INetFwRule* r,const RuleSpec& expected) {
     long protocol=0,profiles=0; NET_FW_RULE_DIRECTION dir; NET_FW_ACTION action; VARIANT_BOOL enabled;
@@ -95,7 +97,7 @@ Result BuildPolicy(const InstallId& id,const std::vector<std::wstring>& apps,con
     auto add=[&](size_t a,int dir,int proto,const std::wstring& remote,const std::wstring& port={},int action=0){ RuleSpec s; s.application=apps[a]; s.direction=dir; s.protocol=proto; s.action=action; s.remoteAddresses=remote; if(dir==1)s.localPorts=port;else s.remotePorts=port; s.name=L"sc-offline: verified "+Utf16(key)+L" "+std::to_wstring(out.size()); out.push_back(std::move(s)); };
     for(size_t a=0;a<apps.size();++a) for(int dir:{1,2}) {
         if(a!=0 || peers.empty()) { add(a,dir,256,L"*"); continue; }
-        add(a,dir,256,L"::/0");
+        add(a,dir,256,L"::/1,8000::/1");
         add(a,dir,17,Complement(peers,0xffffffffull,true));
         add(a,dir,17,Join(peers,true),Complement(ports,65535,false));
         for(int proto=0;proto<256;++proto) if(proto!=17) add(a,dir,proto,L"0.0.0.0-255.255.255.255");
@@ -116,7 +118,7 @@ Result ParsePorts(const std::wstring& value,std::vector<uint16_t>& out) {
     if(value.back()==L',') return Result::Bad("empty multiplayer port"); return Result::Good(State::Unknown);
 }
 Result VerifyPolicy(const std::vector<RuleSpec>& specs) { return WithPolicy([&](Policy& p){ if(specs.empty()) throw std::runtime_error("no isolation rules"); for(auto& s:specs){Com<INetFwRule> r; Check(p.rules->Item(Bstr(s.name),&r.p)); Verify(r.p,s);} }); }
-Result EnsurePolicy(const std::vector<RuleSpec>& specs) { return WithPolicy([&](Policy& p){ if(specs.empty()) throw std::runtime_error("no isolation rules"); for(auto& s:specs){Com<INetFwRule> r; auto hr=p.rules->Item(Bstr(s.name),&r.p); if(Missing(hr)) Add(p,s); else {Check(hr); Verify(r.p,s);} } }); }
+Result EnsurePolicy(const std::vector<RuleSpec>& specs) { return WithPolicy([&](Policy& p){ if(specs.empty()) throw std::runtime_error("no isolation rules"); for(auto& s:specs){Com<INetFwRule> r; auto hr=p.rules->Item(Bstr(s.name),&r.p); if(Missing(hr)) {try{Add(p,s);}catch(const std::exception& e){throw std::runtime_error(Utf8(s.name)+": "+e.what());}} else {Check(hr); Verify(r.p,s);} } }); }
 Result RemovePolicyRule(const RuleSpec& s) { return WithPolicy([&](Policy& p){ Com<INetFwRule> r; auto hr=p.rules->Item(Bstr(s.name),&r.p); if(Missing(hr)) return; Check(hr); Verify(r.p,s); Check(p.rules->Remove(Bstr(s.name))); }); }
 Result PolicyRulesAbsent(const std::vector<RuleSpec>& specs) { return WithPolicy([&](Policy& p){for(auto& s:specs){Com<INetFwRule> r; auto hr=p.rules->Item(Bstr(s.name),&r.p); if(!Missing(hr)) {Check(hr);throw std::runtime_error("owned rule remains");}}}); }
 }

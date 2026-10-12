@@ -24,6 +24,7 @@
 // Everything printed also goes to data\launcher.log.
 //
 // On Linux, sc-offline.sh runs this inside the game's Wine prefix (see that file).
+#include <winsock2.h>
 #include <windows.h>
 #include <windowsx.h>
 #include <d3d11.h>
@@ -51,6 +52,9 @@
 #include <string>
 #include <vector>
 #include "../src/version.h"
+#include "safety/windows_host.h"
+#include "safety/firewall.h"
+#include "safety/journal.h"
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "../src/third_party/imgui/imgui.h"
 #include "../src/third_party/imgui/imgui_impl_win32.h"
@@ -172,7 +176,9 @@ struct Config {
     bool plugins = true;
     // The Multiplayer tab (co-presence over sco-core's sco.net): on by default, but nothing networks
     // until the player presses Host or Join. multiplayerAllow: extra IPv4 ranges (a VPN), checked.
-    bool multiplayer = true;
+    bool multiplayer = false;
+    bool safetyConfigValid = true;
+    wstring multiplayerPeers, multiplayerPorts;
     wstring multiplayerAllow;
     // Ship terminals (ASOP), personal hangars, the hangar lift and ATC hails in the mod. On by default.
     bool asop = true;
@@ -245,7 +251,7 @@ static bool ReadConfig(const wstring& path, Config& c) {
         else if (!_wcsicmp(k.c_str(), L"start"))      c.start = v;
         else if (!_wcsicmp(k.c_str(), L"block_network") || !_wcsicmp(k.c_str(), L"eac_hosts") || !_wcsicmp(k.c_str(), L"eac_rename")) {
             bool& b = !_wcsicmp(k.c_str(), L"block_network") ? c.firewall : !_wcsicmp(k.c_str(), L"eac_hosts") ? c.eacHosts : c.eacRename;
-            if (!ParseOnOff(v, b)) Out("[!] sc-offline.ini line %d: %ls must be on or off\n", lineNo, k.c_str());
+            if (!ParseOnOff(v, b)) { c.safetyConfigValid = false; Out("[!] sc-offline.ini line %d: %ls must be on or off\n", lineNo, k.c_str()); }
         }
         else if (!_wcsicmp(k.c_str(), L"crash_reports")) {
             if (!ParseOnOff(v, c.crashReports)) Out("[!] sc-offline.ini line %d: crash_reports must be on or off\n", lineNo);
@@ -258,14 +264,12 @@ static bool ReadConfig(const wstring& path, Config& c) {
             if (!ParseOnOff(v, c.plugins)) Out("[!] sc-offline.ini line %d: plugins must be on or off\n", lineNo);
         }
         else if (!_wcsicmp(k.c_str(), L"multiplayer")) {
-            if (!ParseOnOff(v, c.multiplayer)) Out("[!] sc-offline.ini line %d: multiplayer must be on or off\n", lineNo);
+            if (!ParseOnOff(v, c.multiplayer)) { c.safetyConfigValid=false; Out("[!] invalid multiplayer setting\n"); }
         }
+        else if (!_wcsicmp(k.c_str(), L"multiplayer_peers")) c.multiplayerPeers=v;
+        else if (!_wcsicmp(k.c_str(), L"multiplayer_ports")) c.multiplayerPorts=v;
         else if (!_wcsicmp(k.c_str(), L"multiplayer_allow")) {
-            std::vector<Ipv4Range> ranges;
-            if (!ParseAllowList(v, ranges, c.multiplayerAllow)) {
-                c.multiplayerAllow.clear();
-                Out("[!] sc-offline.ini line %d: multiplayer_allow must be up to 8 IPv4 ranges like 100.64.0.0/10 (/8 or narrower); ignored\n", lineNo);
-            }
+            if(!v.empty()) { c.safetyConfigValid=false; Out("[!] multiplayer_allow ranges are no longer supported; use explicit multiplayer_peers and multiplayer_ports\n"); }
         }
         else if (!_wcsicmp(k.c_str(), L"asop")) {
             if (!ParseOnOff(v, c.asop)) Out("[!] sc-offline.ini line %d: asop must be on or off\n", lineNo);
@@ -1700,108 +1704,6 @@ static bool Step(bool dry, const char* fmt, ...) {
     return !dry;
 }
 
-// Copies the mod in, backing up what it replaces, and writes the marker. 0 ok, 2 failed.
-// After a crash the marker is still there: the backups were made then, so they are kept as they are.
-static int PutMod(const wstring& here, const GamePaths& g, const char* mode, bool dry) {
-    const wstring dllSrc = here + L"\\dinput8.dll";
-    const wstring xmlSrc = here + L"\\data\\OfflineDB\\default_1.xml";
-    std::string prev;
-    const bool leftover = ReadAll(g.marker, prev);
-    std::string xmlState = leftover ? Field(prev, "xml") : "";
-
-    if (IsFile(xmlSrc)) {
-        if (xmlState.empty()) {
-            if (IsFile(g.xmlBackup)) xmlState = "backup";
-            else if (IsFile(g.xml)) {
-                xmlState = "backup";
-                if (Step(dry, "back up your default_1.xml to %ls", g.xmlBackup.c_str()) &&
-                    !CopyFileW(g.xml.c_str(), g.xmlBackup.c_str(), TRUE)) {
-                    Out("[!] couldn't back up %ls (error %lu)\n", g.xml.c_str(), GetLastError());
-                    return 2;
-                }
-            } else xmlState = "none";
-        }
-        if (Step(dry, "copy data\\OfflineDB\\default_1.xml to %ls", g.xml.c_str())) {
-            SHCreateDirectoryExW(nullptr, g.userDir.c_str(), nullptr);   // ERROR_ALREADY_EXISTS is fine
-            if (!CopyFileW(xmlSrc.c_str(), g.xml.c_str(), FALSE)) {
-                Out("[!] couldn't copy default_1.xml to %ls (error %lu)\n", g.xml.c_str(), GetLastError());
-                return 2;
-            }
-        }
-    } else {
-        Out("[i] data\\OfflineDB\\default_1.xml is missing; the game's own player data is used\n");
-        if (xmlState.empty()) xmlState = "skip";
-    }
-
-    if (IsFile(g.dll) && !leftover && !Identify(g.dll).ours) {
-        if (IsFile(g.dllBackup))
-            return Out("[!] %ls belongs to another mod and %ls already exists; move one of them away first\n",
-                       g.dll.c_str(), g.dllBackup.c_str()), 2;
-        if (Step(dry, "set aside the other mod's dinput8.dll as %ls", g.dllBackup.c_str()) &&
-            !MoveFileExW(g.dll.c_str(), g.dllBackup.c_str(), 0)) {
-            Out("[!] couldn't rename %ls (error %lu)\n", g.dll.c_str(), GetLastError());
-            return 2;
-        }
-    }
-    if (Step(dry, "copy dinput8.dll to %ls", g.dll.c_str()) && !CopyFileW(dllSrc.c_str(), g.dll.c_str(), FALSE)) {
-        Out("[!] couldn't copy dinput8.dll to %ls (error %lu)\n", g.dll.c_str(), GetLastError());
-        return 2;
-    }
-
-    SYSTEMTIME t; GetLocalTime(&t);
-    char when[32];
-    std::snprintf(when, sizeof(when), "%04u-%02u-%02u %02u:%02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-    std::string bytes;
-    const DllInfo mod = Identify(dllSrc);
-    const std::string marker = std::string("version=") + (mod.version.empty() ? mod.what : mod.version) +
-                               "\nsha256=" + mod.sha + "\nmode=" + mode + "\ntime=" + when + "\nxml=" + xmlState + "\n";
-    if (Step(dry, "write %ls", g.marker.c_str()) && !WriteAll(g.marker, marker))
-        Out("[!] couldn't write %ls (error %lu); uninstall still works, but can't tell whether default_1.xml was yours\n",
-            g.marker.c_str(), GetLastError());
-    return 0;
-}
-
-// Takes the mod out and puts back what PutMod replaced. 0 ok, 3 dinput8.dll couldn't be removed.
-static int TakeMod(const GamePaths& g, bool dry) {
-    std::string marker;
-    const bool haveMarker = ReadAll(g.marker, marker);
-    const std::string xmlState = haveMarker ? Field(marker, "xml") : "";
-    int rc = 0;
-
-    if (IsFile(g.dll)) {
-        if (haveMarker || Identify(g.dll).ours) {
-            if (Step(dry, "delete %ls", g.dll.c_str())) {
-                bool gone = false;
-                for (int tries = 0; tries < 30 && !gone; ++tries) {
-                    gone = DeleteFileW(g.dll.c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
-                    if (!gone) Sleep(1000);
-                }
-                if (!gone) { Out("[!] couldn't delete %ls (error %lu)\n", g.dll.c_str(), GetLastError()); rc = 3; }
-            }
-        } else {
-            Out("[i] %ls isn't sc-offline's; left alone\n", g.dll.c_str());
-        }
-    }
-    if (rc == 0 && IsFile(g.dllBackup) && (dry || !IsFile(g.dll)) &&
-        Step(dry, "put the other mod's dinput8.dll back") && !MoveFileExW(g.dllBackup.c_str(), g.dll.c_str(), 0))
-        Out("[!] couldn't restore %ls (error %lu)\n", g.dllBackup.c_str(), GetLastError());
-
-    if (IsFile(g.xmlBackup) && (xmlState == "backup" || !haveMarker)) {
-        if (Step(dry, "restore your default_1.xml from %ls", g.xmlBackup.c_str()) &&
-            !MoveFileExW(g.xmlBackup.c_str(), g.xml.c_str(), MOVEFILE_REPLACE_EXISTING))
-            Out("[!] couldn't restore %ls (error %lu)\n", g.xmlBackup.c_str(), GetLastError());
-    } else if (xmlState == "none" && IsFile(g.xml)) {
-        if (Step(dry, "delete %ls (there was none before sc-offline)", g.xml.c_str()) && !DeleteFileW(g.xml.c_str()))
-            Out("[!] couldn't delete %ls (error %lu)\n", g.xml.c_str(), GetLastError());
-    } else if (!haveMarker && IsFile(g.xml)) {
-        Out("[i] left %ls in place: an older sc-offline may have put it there, but there's no record of it\n", g.xml.c_str());
-    }
-
-    if (haveMarker && rc == 0 && Step(dry, "delete %ls", g.marker.c_str()) && !DeleteFileW(g.marker.c_str()))
-        Out("[!] couldn't delete %ls (error %lu)\n", g.marker.c_str(), GetLastError());
-    return rc;
-}
-
 static bool OnWine() {
     const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     return ntdll && GetProcAddress(ntdll, "wine_get_version");
@@ -2115,98 +2017,6 @@ static void DescribePcChanges(const std::string& rec) {
 }
 
 // Undoes what the record says this launcher did, then deletes the record. 0 ok, 5 something stayed.
-static int UndoPcChanges(bool dry) {
-    const std::string rec = PcChangesLeft();
-    if (rec.empty()) return 0;
-    int rc = 0;
-    for (const FwRule& r : kFwRules) {
-        if (Field(rec, r.key) == "added" && Step(dry, "remove the firewall rule \"%ls\"", r.name) &&
-            !DeleteFirewallRule(r.name) && FirewallRuleExists(r.name)) {
-            Out("[!] couldn't remove the firewall rule; remove \"%ls\" in Windows Defender Firewall\n", r.name); rc = 5;
-        }
-    }
-    if (Field(rec, "hosts") == "added" && Step(dry, "remove sc-offline's line from the hosts file")) {
-        if (RemoveHostsLine()) FlushDns();
-        else { Out("[!] couldn't edit %ls (error %lu); delete the %s line by hand\n", HostsPath().c_str(), GetLastError(), kEacHost); rc = 5; }
-    }
-    if (Field(rec, "eac") == "renamed" && Step(dry, "rename EasyAntiCheat_EOS.exe.bak back")) {
-        const wstring exe = EacExe(), bak = exe + L".bak";
-        if (IsFile(bak) && !IsFile(exe) && !MoveFileExW(bak.c_str(), exe.c_str(), 0)) {
-            Out("[!] couldn't rename %ls back (error %lu)\n", bak.c_str(), GetLastError()); rc = 5;
-        }
-    }
-    if (rc == 0 && !dry) DeleteFileW(PcChangesPath().c_str());
-    return rc;
-}
-
-// Makes the wanted changes and records each one as soon as it is made. 0 ok, 5 failed (anything
-// already changed stays recorded, and the caller undoes it).
-static int ApplyPcChanges(const PcWanted& w, const wstring& gameExe, bool dry) {
-    std::string rec = PcChangesLeft();   // a leftover record after a crash: keep it, add to it
-    const wstring dir = ParentDir(PcChangesPath());
-    if (!dry) CreateDirectoryW(dir.c_str(), nullptr);
-    auto record = [&](const char* key, const char* value) {
-        if (Field(rec, key) == value) return;
-        rec += std::string(key) + "=" + value + "\n";
-        if (!WriteAll(PcChangesPath(), rec)) Out("[!] couldn't write %ls (error %lu)\n", PcChangesPath().c_str(), GetLastError());
-    };
-    if (!dry && rec.find("time=") == std::string::npos) {
-        SYSTEMTIME t; GetLocalTime(&t);
-        char ts[32]; std::snprintf(ts, sizeof(ts), "%04u-%02u-%02u %02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
-        record("time", ts);
-    }
-
-    if (w.firewall) {
-        const wstring bin = ParentDir(gameExe);
-        const wstring exes[] = { gameExe, RsiLauncherExe(bin), CrashHandlerExe(bin) };
-        std::vector<Ipv4Range> allow;
-        wstring allowText;
-        if (w.lan && !ParseAllowList(w.allow, allow, allowText)) { Out("[!] multiplayer_allow ignored (not a list of IPv4 ranges)\n"); allow.clear(); allowText.clear(); }
-        for (size_t i = 0; i < ARRAYSIZE(exes); ++i) {   // kFwRules' first three: the block rules
-            const FwRule& r = kFwRules[i];
-            if (exes[i].empty()) { if (i == 1) Out("[i] RSI Launcher.exe not found; not blocking it\n"); continue; }
-            if (Field(rec, r.key) == "added" && !dry && FirewallRuleExists(r.name)) Out("[i] firewall rule \"%ls\" already in place\n", r.name);
-            else if (Step(dry, "add a firewall rule blocking %ls", exes[i].c_str())) {
-                const wstring remote = i == 0 && w.lan ? BlockedOutsideLan(allow) : L"";
-                bool added = AddFirewallRule(r.name, exes[i], remote);
-                if (!added && !remote.empty()) {   // fail closed: block every address, as without multiplayer
-                    DeleteFirewallRule(r.name);
-                    Out("[!] couldn't leave your LAN open in the firewall rule; blocking every address (multiplayer can't reach other PCs)\n");
-                    added = AddFirewallRule(r.name, exes[i]);
-                }
-                if (!added) { Out("[!] couldn't add the firewall rule (netsh failed)\n"); DeleteFirewallRule(r.name); return 5; }
-                record(r.key, "added");
-            }
-        }
-        if (w.lan) {
-            if (Field(rec, "fw_mp") == "added" && !dry && FirewallRuleExists(kMpRule)) Out("[i] firewall rule \"%ls\" already in place\n", kMpRule);
-            else if (Step(dry, "add a firewall rule letting your LAN%ls reach %ls over UDP (multiplayer)", allowText.empty() ? L"" : L" and multiplayer_allow", gameExe.c_str())) {
-                if (AddMultiplayerRule(gameExe, allowText)) record("fw_mp", "added");
-                else { DeleteFirewallRule(kMpRule); Out("[!] couldn't add the multiplayer firewall rule; a session you host may not be reachable\n"); }
-            }
-        }
-    }
-    if (w.eacHosts) {
-        if (HostsBlocksEac()) Out("[i] hosts file already blocks %s\n", kEacHost);
-        else if (Step(dry, "add `127.0.0.1 %s` to the hosts file", kEacHost)) {
-            if (!AddHostsLine()) { Out("[!] couldn't edit %ls (error %lu); antivirus may protect it\n", HostsPath().c_str(), GetLastError()); return 5; }
-            record("hosts", "added");
-            FlushDns();
-        }
-    }
-    if (w.eacRename) {
-        const wstring exe = EacExe(), bak = exe + L".bak";
-        if (!IsFile(exe)) Out("[i] Easy Anti-Cheat is already off or not installed\n");
-        else if (Step(dry, "rename EasyAntiCheat_EOS.exe to .bak")) {
-            if (!MoveFileExW(exe.c_str(), bak.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-                Out("[!] couldn't rename %ls (error %lu)\n", exe.c_str(), GetLastError()); return 5;
-            }
-            record("eac", "renamed");
-        }
-    }
-    return 0;
-}
-
 static bool NeedsPcChanges(const PcWanted& w) { return !OnWine() && (w.firewall || w.eacHosts || w.eacRename); }
 
 static wstring PcFlags(const PcWanted& w) {
@@ -2235,40 +2045,77 @@ static PcWanted ParsePcFlags(const wstring& f) {
 // signal the event, wait for the launcher and every StarCitizen.exe to exit, then take the mod
 // out and undo the PC changes. install: put in. uninstall: take out and undo leftover PC changes.
 // Exit codes: 0 ok, 2 copy failed, 3 removal failed, 4 bad args, 5 PC change failed.
-static int Helper(const wstring& op, const wstring& bin, DWORD parentPid, const wstring& eventName, const wstring& flags,
-                  const wstring& allow) {
-    const wstring here = ExeDir();
-    OpenLog(here + L"\\data", true, Narrow(L"helper " + op).c_str());
-    const GamePaths g(bin);
-    if (!_wcsicmp(op.c_str(), L"uninstall")) { const int a = TakeMod(g, false), b = UndoPcChanges(false); return a ? a : b; }
-    const bool play = !_wcsicmp(op.c_str(), L"play");
-    if (!play && _wcsicmp(op.c_str(), L"install")) return 4;
-    HANDLE parent = play ? OpenProcess(SYNCHRONIZE, FALSE, parentPid) : nullptr;
-    if (play && !parent) return 4;
-    if (play) {
-        PcWanted wanted = ParsePcFlags(flags);
-        wanted.allow = allow;
-        const int pc = ApplyPcChanges(wanted, bin + L"\\" + kGameExe, false);
-        if (pc) { UndoPcChanges(false); CloseHandle(parent); return pc; }
+static sco::safety::Options SafetyOptions(const wstring& bin,const wstring& here,const Config& cfg) {
+    sco::safety::Options o;
+    o.bin=bin; o.package=here; o.launcher=RsiLauncherExe(bin); o.crashHandler=CrashHandlerExe(bin);
+    o.eacHosts=cfg.eacHosts; o.eacRename=cfg.eacRename;
+    o.multiplayer=cfg.multiplayer; o.peers=cfg.multiplayerPeers; o.ports=cfg.multiplayerPorts;
+    return o;
+}
+static bool SafetyConfig(const Config& cfg) {
+    if(!cfg.safetyConfigValid || !cfg.firewall) { Out("[!] verified isolation is mandatory; block_network must be on and network settings valid\n");return false; }
+    if(cfg.multiplayer) {
+        std::vector<uint32_t> peers; std::vector<uint16_t> ports;
+        auto a=sco::safety::ParsePeers(cfg.multiplayerPeers,peers), b=sco::safety::ParsePorts(cfg.multiplayerPorts,ports);
+        sco::safety::InstallId id;id.canonicalBin=L"validation";std::vector<sco::safety::RuleSpec> rules;
+        auto c=sco::safety::BuildPolicy(id,{L"validation"},peers,ports,rules);
+        if(!a.ok || !b.ok || !c.ok || peers.empty() || ports.empty()) {Out("[!] multiplayer requires up to 8 explicit IPv4 peers and UDP ports (1024-65535); broad ranges are forbidden\n");return false;}
     }
-    const int rc = PutMod(here, g, play ? "play" : "install", false);
-    if (rc) { if (parent) { UndoPcChanges(false); CloseHandle(parent); } return rc; }
-    if (HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName.c_str())) { SetEvent(ready); CloseHandle(ready); }
-    if (!play) return 0;
-
-    // Clean up when the launcher says the game closed (before it asks anything), or when the
-    // launcher exits, whichever comes first.
-    HANDLE closed = OpenEventW(SYNCHRONIZE, FALSE, (eventName + L"-closed").c_str());
-    HANDLE waitFor[2] = { parent, closed };
-    WaitForMultipleObjects(closed ? 2 : 1, waitFor, FALSE, INFINITE);
-    if (closed) CloseHandle(closed);
-    CloseHandle(parent);
-    while (GameRunning()) Sleep(2000);
-    const int taken = TakeMod(g, false);
-    const bool hadPc = !PcChangesLeft().empty();
-    const int undone = UndoPcChanges(false);
-    if (hadPc && undone == 0) Out("[+] PC changes undone\n");
-    return taken ? taken : undone;
+    return true;
+}
+static int SafetyResult(const sco::safety::Result& r) {
+    Out("Isolation: %s\n",sco::safety::StateName(r.state));
+    for(auto& issue:r.issues) Out("[!] %s\n",issue.c_str());
+    return r.ok ? 0 : 5;
+}
+static void StopManagedGame(const sco::safety::InstallId& install) {
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0); if(snap==INVALID_HANDLE_VALUE)return;
+    PROCESSENTRY32W pe{};pe.dwSize=sizeof(pe);
+    for(BOOL ok=Process32FirstW(snap,&pe);ok;ok=Process32NextW(snap,&pe)) {
+        if(_wcsicmp(pe.szExeFile,kGameExe))continue;
+        HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|PROCESS_TERMINATE|SYNCHRONIZE,FALSE,pe.th32ProcessID);
+        if(!process)continue;wchar_t path[32768];DWORD n=32768;
+        if(QueryFullProcessImageNameW(process,0,path,&n)) {
+            sco::safety::InstallId found;
+            if(sco::safety::ResolveInstall(ParentDir(wstring(path,n)),found).ok && found==install) {TerminateProcess(process,5);WaitForSingleObject(process,5000);}
+        }CloseHandle(process);
+    }CloseHandle(snap);
+}
+static int Helper(const wstring& op,const wstring& bin,DWORD parentPid,const wstring& eventName,const wstring&,const wstring&) {
+    using namespace sco::safety;
+    const wstring here=ExeDir();OpenLog(here+L"\\data",true,Narrow(L"helper "+op).c_str());
+    if(OnWine())return SafetyResult(Result::Bad("Wine modifications require a supported host isolation adapter"));
+    Config cfg;ReadConfig(here+L"\\sc-offline.ini",cfg);
+    const bool restore=!_wcsicmp(op.c_str(),L"uninstall"),play=!_wcsicmp(op.c_str(),L"play");
+    if(!restore && !play && _wcsicmp(op.c_str(),L"install"))return 4;
+    if(!restore && !SafetyConfig(cfg))return 5;
+    WindowsHost host(SafetyOptions(bin,here,cfg));sco::safety::Journal journal;
+    auto r=host.Initialize(journal,restore?Operation::Restore:play?Operation::Play:Operation::Install);
+    if(!r.ok)return SafetyResult(r);
+    if(restore)return SafetyResult(Restore(host,journal));
+    HANDLE parent=play?OpenProcess(SYNCHRONIZE,FALSE,parentPid):nullptr;
+    if(play && !parent)return SafetyResult(Result::Bad("launcher process disappeared; isolation retained"));
+    r=Prepare(host,journal);if(!r.ok){if(parent)CloseHandle(parent);return SafetyResult(r);}
+    HANDLE ready=OpenEventW(EVENT_MODIFY_STATE,FALSE,eventName.c_str());
+    if(!ready){if(parent)CloseHandle(parent);return SafetyResult(Result::Bad("helper readiness event unavailable; isolation retained"));}
+    SetEvent(ready);CloseHandle(ready);
+    if(!play)return SafetyResult(r);
+    HANDLE closed=OpenEventW(SYNCHRONIZE,FALSE,(eventName+L"-closed").c_str());
+    HANDLE waits[2]={parent,closed};bool exiting=false;
+    for(;;) {
+        auto wait=WaitForMultipleObjects(closed?2:1,waits,FALSE,1000);
+        if(wait==WAIT_FAILED){r=Result::Bad("helper supervision failed");break;}
+        if(wait!=WAIT_TIMEOUT)exiting=true;
+        r=host.VerifyIsolation(journal);
+        if(!r.ok)break;
+        if(exiting && !GameRunning())break;
+    }
+    if(closed)CloseHandle(closed);CloseHandle(parent);
+    if(!r.ok) {
+        StopManagedGame(journal.install);journal.state=State::RecoveryRequired;host.Save(journal);
+        Out("[!] isolation verification failed; managed game stopped, recovery retained\n");return SafetyResult(r);
+    }
+    return SafetyResult(Restore(host,journal));
 }
 
 static bool IsElevated() {
@@ -2338,8 +2185,7 @@ static HANDLE StartHelper(const wchar_t* op, const GamePaths& g, const wstring& 
     const wstring args = L"--helper " + wstring(op) + L" \"" + g.bin + L"\" " + std::to_wstring(GetCurrentProcessId()) +
                          L" " + eventName + L" " + PcFlags(pc) + (pc.lan && !pc.allow.empty() ? L" " + pc.allow : L"");
     const bool isPlay = !_wcsicmp(op, L"play");
-    const bool pcChanges = (isPlay && NeedsPcChanges(pc)) ||
-                           ((isPlay || !_wcsicmp(op, L"uninstall")) && !PcChangesLeft().empty());
+    const bool pcChanges = true; // Both transient and persistent changes require elevated isolation.
     if (!pcChanges && CanWriteTo(g.bin) && CanWriteTo(ParentDir(g.bin))) {
         wstring cmd = L"\"" + wstring(self) + L"\" " + args;
         STARTUPINFOW si{};
@@ -2428,13 +2274,13 @@ static CheckResult SelfChecks(const wstring& here, const Config& cfg, const Game
         DescribePcChanges(pcLeft);
         if (!GameRunning()) Out("    Run `sc-offline.exe uninstall` to undo them before going online.\n");
     }
-    if (!OnWine()) Out("Network:  %s%s\n", cfg.firewall ? "blocked for StarCitizen.exe, RSI Launcher.exe and CrashHandler.exe while you play (block_network)"
+    if (!OnWine()) Out("Network:  %s%s\n", cfg.firewall ? "mandatory isolation requested; actual rule verification is reported separately"
                                                          : "NOT blocked (block_network = off)",
-                       cfg.firewall && cfg.multiplayer ? "; your LAN stays reachable for the Multiplayer tab (multiplayer)" : "");
+                       cfg.firewall && cfg.multiplayer ? "; explicit multiplayer peer/UDP-port restrictions requested" : "");
 
     // 5. Easy Anti-Cheat.
     const Eac eac = EacState();
-    Out("EAC:      %s\n", eac == Eac::Active ? "ACTIVE" : eac == Eac::Disabled ? "disabled (EasyAntiCheat_EOS.exe.bak)" : "not installed");
+    Out("EAC:      %s\n", eac == Eac::Active ? "executable present (file-presence preflight)" : eac == Eac::Disabled ? "legacy .bak present (recovery conflict)" : "executable absent (not proof of inactive components)");
     if (OnWine()) Out("Hosts:    checked by sc-offline.sh against /etc/hosts\n");
     else Out("Hosts:    %s\n", HostsBlocksEac() ? "EAC download server blocked" : "EAC download server NOT blocked");
     const bool autoEac = !OnWine() && cfg.eacRename;
@@ -2589,34 +2435,17 @@ static void RefreshLight() {
     g.pluginsOn = cfg.plugins;
     wstring bin = cfg.game.empty() ? L"" : ToBin64(cfg.game, cfg.channel);
     if (bin.empty()) { std::vector<Found> f; FromRemembered(g.here, cfg.channel, f); if (!f.empty()) bin = f.front().bin; }
-    std::vector<std::string> left;
-    if (!bin.empty()) {
-        const GamePaths p(bin);
-        const DllInfo d = Identify(p.dll);
-        if (IsFile(p.marker) || (d.present && d.ours)) left.push_back("the mod is still in Bin64");
-    }
-    const std::string pc = PcChangesLeft();
-    if (!pc.empty()) {
-        for (const FwRule& r : kFwRules) if (Field(pc, r.key) == "added") left.push_back("firewall rule \"" + Narrow(r.name) + "\"");
-        if (Field(pc, "hosts") == "added") left.push_back("the EAC line in the hosts file");
-        if (Field(pc, "eac") == "renamed") left.push_back("EasyAntiCheat_EOS.exe renamed to .bak");
-    }
-    g.hasLeftovers = !left.empty();
-    g.gameUp = GameRunning();
-    if (g.gameUp) {
-        g.lightTitle = "Not safe to go online";
-        g.lightDetail = "Star Citizen is running. When it closes, sc-offline takes the mod out and undoes its PC changes.";
-    } else if (!left.empty()) {
-        g.lightTitle = "Not safe to go online yet";
-        g.lightDetail = "Click Uninstall to undo: ";
-        for (size_t i = 0; i < left.size(); ++i) g.lightDetail += (i ? "; " : "") + left[i];
-    } else if (bin.empty()) {
-        g.lightTitle = "Game folder not known yet";
-        g.lightDetail = "Click Status or Play to find it. No PC changes are left over.";
-    } else {
-        g.lightTitle = "Safe to go online";
-        g.lightDetail = "The mod is out of the game folder and no PC changes are left.";
-    }
+    g.gameUp=GameRunning();g.hasLeftovers=false;
+    if(bin.empty()){g.lightTitle="State unknown";g.lightDetail="Select an installation and run Status.";return;}
+    sco::safety::WindowsHost host(SafetyOptions(bin,g.here,cfg));sco::safety::Journal journal;
+    auto status=host.Status(journal);
+    std::vector<sco::safety::Journal> known;auto all=sco::safety::WindowsHost::KnownTransactions(known);
+    if(!all.ok)status=all;
+    for(auto& item:known)if(item.state!=sco::safety::State::Restored){g.hasLeftovers=true;if(item.install.canonicalBin!=journal.install.canonicalBin){status=sco::safety::Result::Bad("another installation needs recovery: "+sco::safety::Utf8(item.install.canonicalBin));}}
+    g.lightTitle=sco::safety::StateName(status.state);
+    g.lightDetail=status.ok ? (status.state==sco::safety::State::Restored ? "Recorded restoration verified for this installation; official compatibility is not established." : "Recorded isolation verified; use Uninstall for restoration.") : "Run Status to inspect recovery conditions.";
+    for(auto& issue:status.issues)g.lightDetail+=" "+issue;
+    if(!status.ok)g.hasLeftovers=true;
 }
 
 static void IndexLines() {
@@ -4125,8 +3954,8 @@ static const char* kUsage =
     "usage: sc-offline.exe [command] [--game <folder>] [--dry-run] [--skip-eac-check]\n"
     "\n"
     "  play       (default) copy the mod in, start the game, take the mod out when it closes\n"
-    "  install    copy the mod in and leave it there; run `uninstall` before going online\n"
-    "  uninstall  take the mod out and restore anything it replaced\n"
+    "  install    install with persistent verified isolation; use controlled play or uninstall\n"
+    "  uninstall  restore and verify the journal before releasing owned isolation rules\n"
     "  status     check the setup and report; changes nothing\n"
     "  update     check GitHub for a newer sc-offline and offer to install it (saves and ini kept)\n"
     "  help       show this\n"
@@ -4199,6 +4028,10 @@ int wmain(int argc, wchar_t** argv) {
     if (cfg.discordOff && !dry && SetPluginDisabled(here, L"discord", true) && DropIniKey(here + L"\\sc-offline.ini", "discord_presence"))
         Out("[i] discord_presence = off: the Discord plugin is turned off (data\\plugins\\discord\\disabled)\n");
 
+    if(command==L"play" || command==L"install") {
+        if(OnWine())return Fail("Wine play/install is disabled until host isolation is supported.");
+        if(!SafetyConfig(cfg))return kExitError;
+    }
     // 0. Updates (issue #14). Never blocks play: no network, a timeout or any odd reply is just skipped.
     if (command == L"update" || (cfg.checkUpdates && !dry && (command == L"play" || command == L"status"))) {
         const bool explicitUpdate = command == L"update";
@@ -4268,21 +4101,23 @@ int wmain(int argc, wchar_t** argv) {
     // 2. Self-checks.
     const CheckResult checks = SelfChecks(here, cfg, g);
     Out("\n");
-    if (command == L"status") return kExitOk;
+    if(command==L"status") {
+        sco::safety::WindowsHost host(SafetyOptions(bin,here,cfg));sco::safety::Journal journal;
+        auto r=host.Status(journal);std::vector<sco::safety::Journal> all;
+        auto listed=sco::safety::WindowsHost::KnownTransactions(all);if(!listed.ok)r=listed;
+        for(auto& item:all)if(item.state!=sco::safety::State::Restored && item.install.canonicalBin!=journal.install.canonicalBin) {Out("[!] other dirty installation: %ls\n",item.install.canonicalBin.c_str());r=sco::safety::Result::Bad("other installation recovery required");}
+        return SafetyResult(r)?kExitError:kExitOk;
+    }
 
     const bool running = GameRunning();
     if (command == L"uninstall") {
         if (running) return FailCode(kExitRunning, "%ls is running. Close it first.", kGameExe);
-        if (dry) return (TakeMod(g, true) | UndoPcChanges(true)) ? kExitError : kExitOk;
+        if(dry){Out("[dry-run] verify journal, restore recorded files, verify clean state, then release only owned isolation rules\n");return kExitOk;}
     } else {
         if (!IsFile(here + L"\\dinput8.dll"))
             return Fail("dinput8.dll is missing next to sc-offline.exe.\n    Extract the whole zip into one folder and run this from there.");
         if (running) return FailCode(kExitRunning, "%ls is already running. Close it first.", kGameExe);
-        if (checks.pcLeftover && !dry && command == L"play") {
-            if (AskYes("Undo them now and stop, instead of playing?")) { Out("[i] undoing them (same as `sc-offline.exe uninstall`)\n"); command = L"uninstall"; }
-            else Out("[i] playing; they are undone together with this session's changes when the game closes.\n");
-        }
-        const bool playHandlesEac = command == L"play" && cfg.eacRename && !OnWine();
+        const bool playHandlesEac = (command == L"play" || command == L"install") && cfg.eacRename && !OnWine();
         if (checks.eacActive && !skipEac && !playHandlesEac)
             return FailCode(kExitEac, "stopped: Easy Anti-Cheat is active (see above). --skip-eac-check overrides this.");
     }
@@ -4298,7 +4133,8 @@ int wmain(int argc, wchar_t** argv) {
         SetVar(L"SC_OFFLINE_START_SHIP", cfg.startShip);
         SetVar(L"SC_OFFLINE_PLUGINS", cfg.plugins ? L"on" : L"off");
         SetVar(L"SC_OFFLINE_MULTIPLAYER", cfg.multiplayer ? L"on" : L"off");
-        SetVar(L"SC_OFFLINE_MULTIPLAYER_ALLOW", cfg.multiplayerAllow);
+        wstring scope; if(cfg.multiplayer){std::vector<uint32_t> peers;sco::safety::ParsePeers(cfg.multiplayerPeers,peers);for(auto ip:peers){if(!scope.empty())scope+=L",";scope+=std::to_wstring(ip>>24)+L"."+std::to_wstring((ip>>16)&255)+L"."+std::to_wstring((ip>>8)&255)+L"."+std::to_wstring(ip&255)+L"/32";}}
+        SetVar(L"SC_OFFLINE_MULTIPLAYER_ALLOW",scope);
         SetVar(L"SC_OFFLINE_ASOP", cfg.asop ? L"on" : L"off");
         SetVar(L"SC_OFFLINE_ASOP_FLEET_LIST", cfg.asopFleetList);
         SetVar(L"SC_OFFLINE_MINING", cfg.mining ? L"on" : L"off");
@@ -4313,14 +4149,8 @@ int wmain(int argc, wchar_t** argv) {
 
     // 4. Change the game folder, through the helper (see the top of this file).
     if (dry) {
-        if (play && NeedsPcChanges(pc)) ApplyPcChanges(pc, bin + L"\\" + kGameExe, true);
-        if (command == L"uninstall") UndoPcChanges(true);
-        if (PutMod(here, g, play ? "play" : "install", true)) return kExitError;
-        if (play) {
-            Out("[dry-run] would start %ls\\%ls\n", bin.c_str(), kGameExe);
-            Out("[dry-run] after the game closes: take the mod out, put back what was set aside, undo the PC changes\n");
-            if (cfg.cleanLogs) Out("[dry-run] then list this session's Game.log, logbackups and crash files and ask (twice) before deleting them\n");
-        }
+        Out("[dry-run] require verified isolation; durably record originals and changes before installing\n");
+        Out("[dry-run] %s\n",play?"start supervised game, then verify restoration before network release":"leave persistent installation isolated until verified Uninstall");
         return kExitOk;
     }
     const wstring eventName = L"Local\\sc-offline-ready-" + std::to_wstring(GetCurrentProcessId());
@@ -4335,8 +4165,8 @@ int wmain(int argc, wchar_t** argv) {
         CloseHandle(helper); CloseHandle(ready);
         if (code) return Fail("the helper failed (exit %lu); see data\\launcher.log", code);
         if (command == L"install")
-            Out("Mod:      installed. Start the game your usual way; run `sc-offline.exe uninstall` before going online.\n");
-        else Out("Mod:      removed.\n");
+            Out("Mod:      installed. Isolation remains persistent. Use sc-offline Play; Uninstall verifies restoration before release.\n");
+        else Out("Mod:      recorded restoration verified.\n");
         return kExitOk;
     }
 
@@ -4356,6 +4186,10 @@ int wmain(int argc, wchar_t** argv) {
 
     // 5. Play. The game runs with normal rights, never the helper's, and never administrator's even
     //    when this window was started with "Run as administrator" (StartGame says why).
+    sco::safety::WindowsHost safetyHost(SafetyOptions(bin,here,cfg));sco::safety::Journal activeJournal;
+    auto beforeLaunch=safetyHost.Load(activeJournal);
+    if(beforeLaunch.ok)beforeLaunch=safetyHost.VerifyIsolation(activeJournal);
+    if(!beforeLaunch.ok){if(closed)SetEvent(closed);CloseHandle(helper);return Fail("isolation failed before launch; recovery required");}
     const wstring exe = bin + L"\\" + kGameExe;
     wstring cmd = L"\"" + exe + L"\"";
     PROCESS_INFORMATION pi{};
@@ -4373,23 +4207,34 @@ int wmain(int argc, wchar_t** argv) {
     } else {
         if (!checks.gameBuild.empty()) WriteAll(data + L"\\game-build.txt", checks.gameBuild + "\n");
         Out("\nPlaying. When the game closes, the mod is removed from Bin64.\n");
-        WaitForSingleObject(pi.hProcess, INFINITE);
+        while(WaitForSingleObject(pi.hProcess,1000)==WAIT_TIMEOUT) {
+            auto verified=safetyHost.VerifyIsolation(activeJournal);
+            if(!verified.ok || WaitForSingleObject(helper,0)==WAIT_OBJECT_0) {
+                Out("[!] isolation supervision failed; stopping managed game and retaining recovery\n");
+                TerminateProcess(pi.hProcess,5);WaitForSingleObject(pi.hProcess,5000);rc=kExitError;break;
+            }
+        }
         CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-        while (GameRunning()) Sleep(2000);   // the game can hand over to a second StarCitizen.exe
+        while(GameRunning()) {
+            auto verified=safetyHost.VerifyIsolation(activeJournal);
+            if(!verified.ok || WaitForSingleObject(helper,0)==WAIT_OBJECT_0){StopManagedGame(activeJournal.install);rc=kExitError;}
+            Sleep(1000);
+        } // Supervise handoff processes belonging to the same canonical installation.
         // Take the mod out and undo the PC changes now, before any question below: a question
         // left unanswered must not keep the game folder modded or the firewall rules in place.
         if (closed) SetEvent(closed);
         if (WaitForSingleObject(helper, 120000) == WAIT_OBJECT_0) {
             DWORD code = 1; GetExitCodeProcess(helper, &code);
-            if (code == 0) Out("Mod:      removed from Bin64; PC changes undone. Safe to go online.\n");
-            else Out("[!] the helper couldn't undo everything (exit %lu); click Uninstall. See data\\launcher.log\n", code);
+            if (code == 0) Out("Mod:      recorded restoration verified.\n");
+            else {rc=kExitError;Out("[!] recovery required (helper exit %lu); isolation retained where possible. See data\\launcher.log\n",code);}
         }
         if (cfg.crashReports && OwnsConsoleInput()) OfferCrashReport(here, ParentDir(bin), sessionStart, checks.gameBuild);
         if (cfg.cleanLogs && OwnsConsoleInput()) OfferToCleanLogs(ParentDir(bin), sessionStart);
         else if (cfg.cleanLogs) Out("Logs:     not asking (no console to answer in); run from a window to be asked\n");
     }
+    if(closed)SetEvent(closed);
     if (WaitForSingleObject(helper, 0) != WAIT_OBJECT_0)
-        Out("Mod:      the helper removes it from Bin64 and undoes the PC changes as this window closes.\n");
+        {rc=kExitError;Out("Mod:      recovery has not completed; inspect Status before any further launch.\n");}
     CloseHandle(helper);
     if (closed) CloseHandle(closed);
     if (rc) PauseIfOwnConsole();

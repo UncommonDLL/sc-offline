@@ -5,7 +5,7 @@ using namespace sco::safety;
 static uint32_t Ip(const std::wstring& s) { unsigned a,b,c,d; swscanf_s(s.c_str(),L"%u.%u.%u.%u",&a,&b,&c,&d); return (a<<24)|(b<<16)|(c<<8)|d; }
 static bool Address(const std::wstring& set,uint32_t ip) {
     if(set==L"*") return true;
-    if(set==L"::/0") return false;
+    if(set.find(L':')!=set.npos) return false;
     std::wistringstream in(set); std::wstring v;
     while(std::getline(in,v,L',')) { auto p=v.find(L'-'); if(p==v.npos ? Ip(v)==ip : Ip(v.substr(0,p))<=ip && ip<=Ip(v.substr(p+1))) return true; } return false;
 }
@@ -24,8 +24,11 @@ int main() {
     if(!BuildPolicy(id,{L"c:\\fake\\bin64\\StarCitizen.exe"},{0xc0a80102},{64090},rules).ok) return 2;
     for(int dir:{1,2}) {
         if(Blocked(rules,dir,17,0xc0a80102,64090)) return 3;
-        if(!Blocked(rules,dir,17,0xc0a80103,64090) || !Blocked(rules,dir,17,0xc0a80102,443) || !Blocked(rules,dir,6,0xc0a80102,64090)) return 4;
+        if(!Blocked(rules,dir,17,0xc0a80103,64090) || !Blocked(rules,dir,17,0xc0a80102,443) || !Blocked(rules,dir,17,0xc0a80102,0) || !Blocked(rules,dir,6,0xc0a80102,64090)) {std::cerr<<"only approved UDP ports may be excluded, including port zero\n";return 4;}
         for(int p=0;p<256;++p) if(p!=17 && !Blocked(rules,dir,p,0xc0a80102,64090)) return 5;
     }
+    std::vector<uint32_t> peers;std::vector<uint16_t> ports;
+    if(ParsePeers(L"192.168.1.0/24",peers).ok || ParsePeers(L"192.168.1.2,",peers).ok || ParsePorts(L"64090,",ports).ok || ParsePorts(L"80",ports).ok)return 6;
+    if(BuildPolicy(id,{L"game"},{0x7f000001},{64090},rules).ok || BuildPolicy(id,{L"game"},{0xc0a80102},{},rules).ok)return 7;
     std::cout<<"IPv4 peer/port protocol partition tests passed\n";
 }

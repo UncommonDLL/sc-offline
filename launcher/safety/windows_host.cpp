@@ -59,7 +59,7 @@ Result Enumerate(const std::wstring& root,std::vector<Journal>& out) {
 }
 std::string NewId() {GUID g{};if(FAILED(CoCreateGuid(&g)))return {};auto bytes=std::string_view(reinterpret_cast<const char*>(&g),sizeof(g));return Digest(bytes).substr(0,32);}
 bool Has(const std::vector<std::string>& values,const std::string& value){return std::find(values.begin(),values.end(),value)!=values.end();}
-Result FlushDnsChecked() {return Result::Good(State::Unknown);} // Isolation does not depend on DNS cache state.
+
 }
 WindowsHost::WindowsHost(Options o):options(std::move(o)) {
     try{root=options.storeRoot.empty()?Root():options.storeRoot;}catch(...){}
@@ -71,7 +71,8 @@ Result WindowsHost::Validate(const Journal& j)const {
     if(directory.empty() || !(j.install==install))return Result::Bad("installation identity mismatch",State::Unknown);
     InstallId actual;auto r=ResolveInstall(install.canonicalBin,actual);if(!r.ok || !(actual==install))return Result::Bad("installation was moved or replaced",State::Unknown);
     const std::vector<std::wstring> allowed={install.canonicalBin+L"\\dinput8.dll",Parent(install.canonicalBin)+L"\\user\\client\\0\\default_1.xml",Hosts(),Eac()};
-    for(size_t i=0;i<j.files.size();++i){auto& f=j.files[i];if(std::find(allowed.begin(),allowed.end(),f.path)==allowed.end() || f.backupPath!=directory+L"\\"+Utf16(j.transactionId)+L"\\"+std::to_wstring(i)+L".bak")return Result::Bad("journal has invalid file paths",State::Unknown);if(f.existed && f.originalSha256.size()!=64)return Result::Bad("missing original hash",State::Unknown);if(f.replacementExists && (f.replacementSha256.empty() || Digest(f.replacement)!=f.replacementSha256))return Result::Bad("invalid replacement hash",State::Unknown);}
+    std::vector<std::wstring> filePaths;
+    for(size_t i=0;i<j.files.size();++i){auto& f=j.files[i];if(std::find(filePaths.begin(),filePaths.end(),f.path)!=filePaths.end())return Result::Bad("duplicate journal file path",State::Unknown);filePaths.push_back(f.path);if(std::find(allowed.begin(),allowed.end(),f.path)==allowed.end() || f.backupPath!=directory+L"\\"+Utf16(j.transactionId)+L"\\"+std::to_wstring(i)+L".bak")return Result::Bad("journal has invalid file paths",State::Unknown);if(f.existed && f.originalSha256.size()!=64)return Result::Bad("missing original hash",State::Unknown);if(f.replacementExists && (f.replacementSha256.empty() || Digest(f.replacement)!=f.replacementSha256))return Result::Bad("invalid replacement hash",State::Unknown);}
     auto prefix=L"sc-offline: verified "+Utf16(InstallKey(install))+L" ";
     std::vector<std::wstring> names;
     for(auto& rule:j.rules){if(!rule.name.starts_with(prefix) || !rule.name.ends_with(L"-"+Utf16(j.transactionId)) || std::find(names.begin(),names.end(),rule.name)!=names.end())return Result::Bad("invalid rule ownership",State::Unknown);names.push_back(rule.name);}
@@ -111,7 +112,16 @@ Result WindowsHost::Initialize(Journal& j,Operation op) {
     try {
         auto r=Acquire(install);if(!r.ok)return r;
         std::string bytes;bool exists=false;r=ReadBytes(JournalPath(),bytes,exists);if(!r.ok)return r;
-        if(exists){r=Load(j);if(!r.ok)return r;if(op==Operation::Restore)return r;if(j.state==State::Modified){j.mode=op;return Save(j);}if(j.state!=State::Restored)return Result::Bad("recover unfinished transaction first");}
+        if(exists){r=Load(j);if(!r.ok)return r;if(op==Operation::Restore)return r;if(j.state==State::Modified){
+            std::vector<uint32_t> peers;std::vector<uint16_t> ports;std::vector<RuleSpec> desired;
+            if(options.multiplayer){r=ParsePeers(options.peers,peers);if(!r.ok)return r;r=ParsePorts(options.ports,ports);if(!r.ok)return r;if(peers.empty() || ports.empty())return Result::Bad("explicit multiplayer peers/ports required");}
+            r=BuildPolicy(install,{install.canonicalBin+L"\\StarCitizen.exe",options.launcher,options.crashHandler},peers,ports,desired);if(!r.ok)return r;
+            for(auto& rule:desired)rule.name+=L"-"+Utf16(j.transactionId);
+            if(desired!=j.rules)return Result::Bad("persistent isolation configuration changed; Uninstall before installing a new policy");
+            std::string dll;bool found;r=ReadBytes(options.package+L"\\dinput8.dll",dll,found);if(!r.ok || !found || j.files.empty() || Digest(dll)!=j.files.front().replacementSha256)return Result::Bad("persistent package changed; restore before replacing the installed DLL");
+            for(auto& file:j.files){std::string bytes;bool present;r=ReadBytes(file.path,bytes,present);if(!r.ok || present!=file.replacementExists || (present && Digest(bytes)!=file.replacementSha256))return Result::Bad("persistent installed file changed; recovery required");}
+            j.mode=op;return Save(j);
+        }if(j.state!=State::Restored)return Result::Bad("recover unfinished transaction first");}
         if(op==Operation::Restore)return Result::Bad("no managed restoration journal; legacy state requires explicit inspection",State::Unknown);
         r=InspectProcesses();if(!r.ok)return r;
         if(options.launcher.empty() || options.crashHandler.empty())return Result::Bad("RSI Launcher and CrashHandler paths must be resolved before installing");

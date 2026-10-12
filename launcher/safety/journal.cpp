@@ -81,12 +81,21 @@ Result DecodeJournal(std::string_view bytes,Journal& target) {
         for(auto n=r.count(8);n;--n) { FileRecord f; f.path=r.wide(); f.backupPath=r.wide(); f.existed=r.boolean(); f.replacementExists=r.boolean(); f.installed=r.boolean(); f.restored=r.boolean(); f.originalSha256=r.value(); f.replacementSha256=r.value(); f.replacement=r.value(); j.files.push_back(std::move(f)); }
         for(auto n=r.count(2048);n;--n) { RuleSpec s; s.name=r.wide(); s.application=r.wide(); s.localPorts=r.wide(); s.remotePorts=r.wide(); s.remoteAddresses=r.wide(); s.direction=r.number(); s.action=r.number(); s.profiles=r.number(); s.protocol=r.number(); s.enabled=r.boolean(); if(s.direction<1 || s.direction>2 || s.action<0 || s.action>1 || s.profiles!=7 || s.protocol<0 || s.protocol>256) throw std::runtime_error("invalid rule"); j.rules.push_back(std::move(s)); }
         for(auto* list:{&j.intents,&j.completed}) for(auto n=r.count(10000);n;--n) { auto a=r.value(); if(a.empty() || a.size()>128 || std::find(list->begin(),list->end(),a)!=list->end()) throw std::runtime_error("invalid action id"); list->push_back(std::move(a)); }
+        for(auto& action:j.completed)if(std::find(j.intents.begin(),j.intents.end(),action)==j.intents.end())throw std::runtime_error("completion without intent");
         if(r.pos!=payload.size()) throw std::runtime_error("trailing journal data");
         target=std::move(j); return Result::Good(target.state);
     } catch(const std::exception& e) { return Result::Bad(e.what(),State::Unknown); }
 }
+static Result CheckParents(const std::wstring& path) {
+    for(auto parent=std::filesystem::path(path).parent_path();!parent.empty();) {
+        auto attr=GetFileAttributesW(parent.c_str());
+        if(attr!=INVALID_FILE_ATTRIBUTES && (attr&FILE_ATTRIBUTE_REPARSE_POINT))return Result::Bad("reparse file parent refused: "+Utf8(parent.wstring()));
+        if(attr==INVALID_FILE_ATTRIBUTES && GetLastError()!=ERROR_PATH_NOT_FOUND && GetLastError()!=ERROR_FILE_NOT_FOUND)return Result::Bad("cannot inspect file parent");
+        auto next=parent.parent_path();if(next==parent)break;parent=next;
+    }return Result::Good(State::Unknown);
+}
 Result ReadBytes(const std::wstring& path,std::string& bytes,bool& exists) {
-    bytes.clear(); exists=false;
+    bytes.clear(); exists=false;auto parents=CheckParents(path);if(!parents.ok)return parents;
     HANDLE h=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
     if(h==INVALID_HANDLE_VALUE) { auto e=GetLastError(); return e==ERROR_FILE_NOT_FOUND || e==ERROR_PATH_NOT_FOUND ? Result::Good(State::Unknown) : Result::Bad("cannot read "+Utf8(path)); }
     exists=true; BY_HANDLE_FILE_INFORMATION info{}; LARGE_INTEGER size{};
@@ -96,6 +105,7 @@ Result ReadBytes(const std::wstring& path,std::string& bytes,bool& exists) {
     return ok ? Result::Good(State::Unknown) : Result::Bad("incomplete read "+Utf8(path));
 }
 Result AtomicWrite(const std::wstring& path,std::string_view bytes) {
+    auto parents=CheckParents(path);if(!parents.ok)return parents;
     const auto temp=path+L".new-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64());
     HANDLE h=CreateFileW(temp.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,nullptr);
     if(h==INVALID_HANDLE_VALUE) return Result::Bad("cannot stage "+Utf8(path));

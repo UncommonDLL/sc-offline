@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Linux (EXPERIMENTAL, not yet run by anyone): starts sc-offline.exe inside your Star Citizen
-# Wine prefix. sc-offline.exe then finds the game, adds the mod, and removes it on exit, exactly
-# as on Windows.
+# Linux read-only/status/update wrapper: play/install are disabled. Starts sc-offline.exe inside your Star Citizen
+# Wine prefix for inspection commands; it does not install or run a modified client.
 #
 #   ./sc-offline.sh [play|install|uninstall|status|update|help] [--game <Windows path>] [--dry-run]
 #                   [--skip-eac-check] [--prefix <dir>] [--wine <path to wine>]
@@ -18,6 +17,23 @@ set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 eac_host=modules-cdn.eac-prod.on.epicgames.com
+
+# A hosts entry and Wine's Windows firewall emulation are not verified isolation.
+command=play
+for argument in "$@"; do
+    case "$argument" in
+        play|install|uninstall|status|update|help) command=$argument; break ;;
+        --help|-h) command=help; break ;;
+    esac
+done
+if [[ $command == play || $command == install ]]; then
+    echo "[!] Wine play/install is disabled until a supported host isolation adapter is available."
+    exit 1
+fi
+if [[ $command == uninstall ]]; then
+    echo "[!] Wine restoration needs native Windows journal recovery; no Windows network policy can be verified here."
+    exit 1
+fi
 
 prefix=${WINEPREFIX:-}
 prefix_from=${WINEPREFIX:+\$WINEPREFIX}

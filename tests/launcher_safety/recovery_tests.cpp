@@ -28,6 +28,8 @@ int main() {
         auto r=h.Initialize(j,Operation::Install);
         if(r.ok) r=Prepare(h,j); for(auto& issue:r.issues) std::cerr<<issue<<"\n"; if(!r.ok || !std::filesystem::exists(bin/L"dinput8.dll")) {std::cerr<<"native installation transaction missing\n";exit=1;}
         if(!exit) {
+            Options changed=o;changed.multiplayer=true;changed.peers=L"192.168.1.2";changed.ports=L"64090";
+            // Release the live mutex only through destruction; resumed configuration is tested below.
             HANDLE held=CreateFileW((bin/L"dinput8.dll").c_str(),GENERIC_READ,0,nullptr,OPEN_EXISTING,0,nullptr);
             auto failed=Restore(h,j);CloseHandle(held);
             if(failed.ok || j.state!=State::RecoveryRequired || !std::filesystem::exists(bin/L"dinput8.dll")) exit=2;
@@ -35,6 +37,16 @@ int main() {
             if(!exit) {Journal receipt;if(!h.Load(receipt).ok || receipt.state!=State::Restored) exit=4;}
         }
     }
+    if(!exit) {
+        FileHost h(o);Journal j;
+        if(!h.Initialize(j,Operation::Install).ok || !Prepare(h,j).ok)exit=5;
+    }
+    if(!exit) {
+        Options changed=o;changed.multiplayer=true;changed.peers=L"192.168.1.2";changed.ports=L"64090";
+        FileHost h(changed);Journal j;
+        if(h.Initialize(j,Operation::Play).ok){std::cerr<<"persistent policy changes must require restoration\n";exit=6;}
+    }
+    if(!exit) {FileHost h(o);Journal j;if(!h.Initialize(j,Operation::Restore).ok || !Restore(h,j).ok)exit=7;}
     std::filesystem::remove_all(base);
     if(!exit)std::cout<<"native file rollback, locked DLL, restart receipt tests passed\n";
     return exit;
