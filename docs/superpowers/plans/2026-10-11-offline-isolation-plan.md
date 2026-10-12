@@ -4,6 +4,8 @@
 
 **Goal:** Ensure managed modified installations remain isolated until all restoration postconditions are verified.
 
+**Execution record (2026-10-11):** User approved native execution. The five requested behaviors are implemented on `harden-offline-isolation`. The concrete interfaces/tests differ from the illustrative snippets below: tests use direct FakeHost/FileHost fixtures, shared changes are ordinary typed file records, and dirty observation includes VerifyRecoveryEvidence. Release launcher build and all five standalone CTest groups pass, as do 12 manifest and 19 SDK tests. Native disposable-executable policy creation, exact representation checks, disabled-rule rejection, and owned-rule cleanup passed for full-block and narrow multiplayer modes. The final focused review found no remaining important defects after its three findings were fixed. Controlled off-host socket probes and reboot acceptance remain unrun; this execution does not claim those plan cases passed. The additional elevated protected-file ownership creation check was canceled at Windows elevation; standard-user-owned evidence rejection passed. The detailed implementation/validation report accompanies the local patch and source snapshot.
+
 **Architecture:** Extract the launcher's safety lifecycle into a small transaction engine with injectable host operations. A Windows adapter owns durable storage, installation identity, firewall policy, process checks, and verified file operations. CLI helpers and GUI consume the same observed transaction status.
 
 **Tech Stack:** C++20, MSVC x64, Windows Firewall COM interfaces, Windows filesystem/process/service APIs, CMake/CTest, existing Python repository checks. No new runtime service or external network dependency.

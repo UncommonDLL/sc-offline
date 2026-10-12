@@ -14,7 +14,7 @@ Result Prepare(Host& h, Journal& j) {
     r=h.Save(j); if(!r.ok) return Failed(h,j,r);
     r=h.EnsureIsolation(j); if(!r.ok) return Failed(h,j,r);
     r=h.VerifyIsolation(j); if(!r.ok) return Failed(h,j,r);
-    if(j.state==State::Modified) return Result::Good(j.state);
+    if(j.state==State::Modified) {r=h.VerifyRecoveryEvidence(j);return r.ok?Result::Good(j.state):Failed(h,j,r);}
     r=Transition(h,j,State::Isolated); if(!r.ok) return Failed(h,j,r);
     r=h.InstallFiles(j);
     if(!r.ok) {
@@ -37,7 +37,11 @@ Result Restore(Host& h, Journal& j) {
     r=h.InspectProcesses(); if(!r.ok) return Failed(h,j,r);
     r=h.VerifyRestoration(j); if(!r.ok) return Failed(h,j,r);
     r=Transition(h,j,State::ReleasePending); if(!r.ok) return Failed(h,j,r);
-    r=h.ReleaseRules(j); if(!r.ok) return Failed(h,j,r);
+    r=h.ReleaseRules(j); if(!r.ok) {
+        auto isolation=h.EnsureIsolation(j);
+        if(!isolation.ok)r.issues.insert(r.issues.end(),isolation.issues.begin(),isolation.issues.end());
+        return Failed(h,j,r);
+    }
     r=Transition(h,j,State::Restored); if(!r.ok) {
         // Reestablish protection if the completed receipt cannot be persisted.
         auto isolation=h.EnsureIsolation(j);
@@ -57,6 +61,7 @@ Result Observe(Host& h, const Journal& expected) {
     }
     if(j.state!=State::Modified) return Result::Bad("unfinished recovery transaction");
     r=h.VerifyIsolation(j); if(!r.ok) return r;
+    r=h.VerifyRecoveryEvidence(j); if(!r.ok) return r;
     return Result::Good(State::Modified);
 }
 const char* StateName(State s) {

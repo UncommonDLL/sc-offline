@@ -1,6 +1,7 @@
 #include "journal.h"
 #include <windows.h>
 #include <bcrypt.h>
+#include <sddl.h>
 #include <filesystem>
 #include <stdexcept>
 #include <algorithm>
@@ -104,17 +105,21 @@ Result ReadBytes(const std::wstring& path,std::string& bytes,bool& exists) {
     bool ok=ReadFile(h,bytes.data(),static_cast<DWORD>(bytes.size()),&got,nullptr) && got==bytes.size(); CloseHandle(h);
     return ok ? Result::Good(State::Unknown) : Result::Bad("incomplete read "+Utf8(path));
 }
-Result AtomicWrite(const std::wstring& path,std::string_view bytes) {
+Result AtomicWrite(const std::wstring& path,std::string_view bytes,bool protectedRecovery) {
     auto parents=CheckParents(path);if(!parents.ok)return parents;
     const auto temp=path+L".new-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64());
-    HANDLE h=CreateFileW(temp.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,nullptr);
+    PSECURITY_DESCRIPTOR sd=nullptr;
+    if(protectedRecovery && !ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;BU)",SDDL_REVISION_1,&sd,nullptr))return Result::Bad("cannot create protected recovery file security");
+    SECURITY_ATTRIBUTES sa{sizeof(sa),sd,FALSE};
+    HANDLE h=CreateFileW(temp.c_str(),GENERIC_WRITE,0,protectedRecovery?&sa:nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_WRITE_THROUGH,nullptr);
+    if(sd)LocalFree(sd);
     if(h==INVALID_HANDLE_VALUE) return Result::Bad("cannot stage "+Utf8(path));
     DWORD wrote=0; bool ok=WriteFile(h,bytes.data(),static_cast<DWORD>(bytes.size()),&wrote,nullptr) && wrote==bytes.size() && FlushFileBuffers(h); CloseHandle(h);
     if(ok) ok=MoveFileExW(temp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
     if(!ok) { DeleteFileW(temp.c_str()); return Result::Bad("durable replacement failed "+Utf8(path)); }
     return Result::Good(State::Unknown);
 }
-Result SaveJournal(const std::wstring& path,const Journal& j) { std::string bytes; auto r=EncodeJournal(j,bytes); return r.ok ? AtomicWrite(path,bytes) : r; }
+Result SaveJournal(const std::wstring& path,const Journal& j,bool protectedRecovery) { std::string bytes; auto r=EncodeJournal(j,bytes); return r.ok ? AtomicWrite(path,bytes,protectedRecovery) : r; }
 Result LoadJournal(const std::wstring& path,Journal& j) { std::string bytes; bool exists; auto r=ReadBytes(path,bytes,exists); if(!r.ok) return r; return exists ? DecodeJournal(bytes,j) : Result::Bad("no restoration journal",State::Unknown); }
 Result ResolveInstall(const std::wstring& path,InstallId& id) {
     std::error_code ec; auto full=std::filesystem::absolute(path,ec).lexically_normal();

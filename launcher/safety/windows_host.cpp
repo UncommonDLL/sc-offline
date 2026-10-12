@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <sstream>
 #include <stdexcept>
+#include <cwctype>
 
 namespace sco::safety {
 namespace {
@@ -27,8 +28,10 @@ Result SafeParents(const std::wstring& path) {
 }
 Result SecureDirectory(const std::wstring& dir,bool testStore=false) {
     auto r=SafeParents(dir+L"\\file");if(!r.ok)return r;
+    auto attributes=GetFileAttributesW(dir.c_str());
+    if(attributes!=INVALID_FILE_ATTRIBUTES && !testStore){r=VerifyRecoverySecurity(dir);if(!r.ok)return r;}
     PSECURITY_DESCRIPTOR sd=nullptr;
-    std::wstring aclText=L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)";
+    std::wstring aclText=(testStore?L"":L"O:BAG:BA")+std::wstring(L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)");
     if(testStore) { HANDLE token=nullptr; if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))return Result::Bad("test token unavailable"); DWORD cb=0;GetTokenInformation(token,TokenUser,nullptr,0,&cb);std::vector<BYTE> data(cb);bool ok=GetTokenInformation(token,TokenUser,data.data(),cb,&cb)!=0;CloseHandle(token);LPWSTR sid=nullptr;if(!ok || !ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(data.data())->User.Sid,&sid))return Result::Bad("test SID unavailable");aclText+=L"(A;OICI;FA;;;"+std::wstring(sid)+L")";LocalFree(sid);}
     if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(aclText.c_str(),SDDL_REVISION_1,&sd,nullptr)) return Result::Bad("cannot create recovery ACL");
     SECURITY_ATTRIBUTES sa{sizeof(sa),sd,FALSE};
@@ -39,17 +42,21 @@ Result SecureDirectory(const std::wstring& dir,bool testStore=false) {
     if(!created && error==ERROR_ALREADY_EXISTS) {
         if(GetSecurityDescriptorDacl(sd,&present,&acl,&defaulted)) ok=SetNamedSecurityInfoW(const_cast<wchar_t*>(dir.c_str()),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION|PROTECTED_DACL_SECURITY_INFORMATION,nullptr,nullptr,acl,nullptr)==ERROR_SUCCESS;
     }
-    LocalFree(sd);return ok?Result::Good(State::Unknown):Result::Bad("cannot secure recovery directory: "+Utf8(dir));
+    LocalFree(sd);if(!ok)return Result::Bad("cannot secure recovery directory: "+Utf8(dir));
+    return testStore?Result::Good(State::Unknown):VerifyRecoverySecurity(dir);
 }
-Result Enumerate(const std::wstring& root,std::vector<Journal>& out) {
+Result Enumerate(const std::wstring& root,std::vector<Journal>& out,bool testStore=false) {
     out.clear();auto safe=SafeParents(root+L"\\x");if(!safe.ok)return safe;
+    if(!testStore && GetFileAttributesW(root.c_str())!=INVALID_FILE_ATTRIBUTES){safe=VerifyRecoverySecurity(Parent(root));if(!safe.ok)return safe;safe=VerifyRecoverySecurity(root);if(!safe.ok)return safe;}
     WIN32_FIND_DATAW data{};HANDLE find=FindFirstFileW((root+L"\\*").c_str(),&data);
     if(find==INVALID_HANDLE_VALUE) {auto e=GetLastError();return e==ERROR_FILE_NOT_FOUND || e==ERROR_PATH_NOT_FOUND?Result::Good(State::Unknown):Result::Bad("cannot enumerate recovery records",State::Unknown);}
     Result result=Result::Good(State::Unknown);
     do {
         if(data.cFileName[0]==L'.')continue;
         if(!(data.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) || (data.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)) {result=Result::Bad("unexpected recovery-store entry",State::Unknown);break;}
-        Journal j;auto r=LoadJournal(root+L"\\"+data.cFileName+L"\\journal",j);
+        const auto dir=root+L"\\"+data.cFileName;
+        if(!testStore){result=VerifyRecoverySecurity(dir);if(!result.ok)break;result=VerifyRecoverySecurity(dir+L"\\journal");if(!result.ok)break;}
+        Journal j;auto r=LoadJournal(dir+L"\\journal",j);
         if(!r.ok) {result=r;break;}
         if(Utf16(InstallKey(j.install))!=data.cFileName){result=Result::Bad("journal directory identity mismatch",State::Unknown);break;}
         out.push_back(std::move(j));
@@ -59,7 +66,34 @@ Result Enumerate(const std::wstring& root,std::vector<Journal>& out) {
 }
 std::string NewId() {GUID g{};if(FAILED(CoCreateGuid(&g)))return {};auto bytes=std::string_view(reinterpret_cast<const char*>(&g),sizeof(g));return Digest(bytes).substr(0,32);}
 bool Has(const std::vector<std::string>& values,const std::string& value){return std::find(values.begin(),values.end(),value)!=values.end();}
+Result CanonicalExecutable(std::wstring& path) {
+    InstallId parent;auto r=ResolveInstall(Parent(path),parent);if(!r.ok)return r;
+    auto attributes=GetFileAttributesW(path.c_str());
+    if(attributes==INVALID_FILE_ATTRIBUTES || (attributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)))return Result::Bad("missing or reparse executable: "+Utf8(path));
+    HANDLE file=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    if(file==INVALID_HANDLE_VALUE)return Result::Bad("cannot inspect isolation executable: "+Utf8(path));
+    DWORD size=GetFinalPathNameByHandleW(file,nullptr,0,FILE_NAME_NORMALIZED|VOLUME_NAME_DOS);std::wstring resolved(size,L'\0');
+    DWORD got=size?GetFinalPathNameByHandleW(file,resolved.data(),size,FILE_NAME_NORMALIZED|VOLUME_NAME_DOS):0;CloseHandle(file);
+    if(!got || got>=size)return Result::Bad("cannot canonicalize isolation executable");resolved.resize(got);
+    if(resolved.starts_with(L"\\\\?\\"))resolved.erase(0,4);
+    std::transform(resolved.begin(),resolved.end(),resolved.begin(),[](wchar_t c){return std::towlower(c);});path=resolved;return Result::Good(State::Unknown);
+}
 
+}
+Result VerifyRecoverySecurity(const std::wstring& path) {
+    auto safe=SafeParents(path+L"\\x");if(!safe.ok)return safe;
+    PSID owner=nullptr;PACL acl=nullptr;PSECURITY_DESCRIPTOR sd=nullptr;
+    auto error=GetNamedSecurityInfoW(const_cast<wchar_t*>(path.c_str()),SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION,&owner,nullptr,&acl,nullptr,&sd);
+    if(error!=ERROR_SUCCESS)return Result::Bad("cannot inspect recovery ownership: "+Utf8(path));
+    auto trusted=[](PSID sid){return sid && (IsWellKnownSid(sid,WinBuiltinAdministratorsSid) || IsWellKnownSid(sid,WinLocalSystemSid));};
+    bool ok=trusted(owner) && acl;
+    const DWORD write=GENERIC_ALL|GENERIC_WRITE|WRITE_DAC|WRITE_OWNER|DELETE|FILE_DELETE_CHILD|FILE_WRITE_DATA|FILE_APPEND_DATA|FILE_WRITE_EA|FILE_WRITE_ATTRIBUTES;
+    if(ok)for(DWORD i=0;i<acl->AceCount;++i){void* entry=nullptr;if(!GetAce(acl,i,&entry)){ok=false;break;}auto head=static_cast<ACE_HEADER*>(entry);
+        if(head->AceFlags&INHERIT_ONLY_ACE)continue;
+        if(head->AceType==ACCESS_ALLOWED_ACE_TYPE){auto ace=static_cast<ACCESS_ALLOWED_ACE*>(entry);if((ace->Mask&write) && !trusted(&ace->SidStart)){ok=false;break;}}
+        else if(head->AceType!=ACCESS_DENIED_ACE_TYPE){ok=false;break;}
+    }
+    LocalFree(sd);return ok?Result::Good(State::Unknown):Result::Bad("untrusted owner or writable recovery evidence: "+Utf8(path));
 }
 WindowsHost::WindowsHost(Options o):options(std::move(o)) {
     try{root=options.storeRoot.empty()?Root():options.storeRoot;}catch(...){}
@@ -67,10 +101,16 @@ WindowsHost::WindowsHost(Options o):options(std::move(o)) {
 }
 WindowsHost::~WindowsHost(){if(mutex){if(owns)ReleaseMutex(mutex);CloseHandle(mutex);}}
 std::wstring WindowsHost::JournalPath()const{return directory+L"\\journal";}
+std::wstring WindowsHost::EacPath()const{return !options.storeRoot.empty() && !options.testEacPath.empty()?options.testEacPath:Eac();}
 Result WindowsHost::Validate(const Journal& j)const {
     if(directory.empty() || !(j.install==install))return Result::Bad("installation identity mismatch",State::Unknown);
+    if(options.storeRoot.empty()){
+        for(auto& path:{Parent(root),root,directory}){auto security=VerifyRecoverySecurity(path);if(!security.ok)return security;}
+        if(GetFileAttributesW(JournalPath().c_str())!=INVALID_FILE_ATTRIBUTES){auto security=VerifyRecoverySecurity(JournalPath());if(!security.ok)return security;}
+        for(auto& file:j.files)if(GetFileAttributesW(file.backupPath.c_str())!=INVALID_FILE_ATTRIBUTES){auto security=VerifyRecoverySecurity(Parent(file.backupPath));if(!security.ok)return security;security=VerifyRecoverySecurity(file.backupPath);if(!security.ok)return security;}
+    }
     InstallId actual;auto r=ResolveInstall(install.canonicalBin,actual);if(!r.ok || !(actual==install))return Result::Bad("installation was moved or replaced",State::Unknown);
-    const std::vector<std::wstring> allowed={install.canonicalBin+L"\\dinput8.dll",Parent(install.canonicalBin)+L"\\user\\client\\0\\default_1.xml",Hosts(),Eac()};
+    const std::vector<std::wstring> allowed={install.canonicalBin+L"\\dinput8.dll",Parent(install.canonicalBin)+L"\\user\\client\\0\\default_1.xml",Hosts(),EacPath()};
     std::vector<std::wstring> filePaths;
     for(size_t i=0;i<j.files.size();++i){auto& f=j.files[i];if(std::find(filePaths.begin(),filePaths.end(),f.path)!=filePaths.end())return Result::Bad("duplicate journal file path",State::Unknown);filePaths.push_back(f.path);if(std::find(allowed.begin(),allowed.end(),f.path)==allowed.end() || f.backupPath!=directory+L"\\"+Utf16(j.transactionId)+L"\\"+std::to_wstring(i)+L".bak")return Result::Bad("journal has invalid file paths",State::Unknown);if(f.existed && f.originalSha256.size()!=64)return Result::Bad("missing original hash",State::Unknown);if(f.replacementExists && (f.replacementSha256.empty() || Digest(f.replacement)!=f.replacementSha256))return Result::Bad("invalid replacement hash",State::Unknown);}
     auto prefix=L"sc-offline: verified "+Utf16(InstallKey(install))+L" ";
@@ -88,15 +128,15 @@ Result WindowsHost::Acquire(const InstallId& expected) {
     if(!mutex)return Result::Bad("cannot acquire transaction mutex; administrator rights required");
     auto waited=WaitForSingleObject(mutex,0);if(waited!=WAIT_OBJECT_0 && waited!=WAIT_ABANDONED)return Result::Bad("another launcher owns the safety transaction");owns=true;
     r=SafeParents(root+L"\\file");if(!r.ok)return r;
-    // The parent may be a legacy directory; do not change its ACL or legacy records.
-    std::error_code ec;std::filesystem::create_directories(Parent(root),ec);if(ec)return Result::Bad("cannot create recovery root parent");
+    if(options.storeRoot.empty()){r=SecureDirectory(Parent(root));if(!r.ok)return r;}
+    else {std::error_code ec;std::filesystem::create_directories(Parent(root),ec);if(ec)return Result::Bad("cannot create test recovery parent");}
     r=SecureDirectory(root,!options.storeRoot.empty());if(!r.ok)return r;
-    std::vector<Journal> all;r=Enumerate(root,all);if(!r.ok)return r;
+    std::vector<Journal> all;r=Enumerate(root,all,!options.storeRoot.empty());if(!r.ok)return r;
     for(auto& other:all)if(!(other.install==install) && other.state!=State::Restored)return Result::Bad("another installation needs recovery: "+Utf8(other.install.canonicalBin));
     r=SecureDirectory(directory,!options.storeRoot.empty());return r;
 }
-Result WindowsHost::Load(Journal& j){if(directory.empty())return Result::Bad("installation identity unknown",State::Unknown);auto r=LoadJournal(JournalPath(),j);return r.ok?Validate(j):r;}
-Result WindowsHost::Save(const Journal& j){auto r=Validate(j);return r.ok?SaveJournal(JournalPath(),j):r;}
+Result WindowsHost::Load(Journal& j){if(directory.empty())return Result::Bad("installation identity unknown",State::Unknown);if(options.storeRoot.empty()){for(auto& path:{Parent(root),root,directory,JournalPath()}){auto security=VerifyRecoverySecurity(path);if(!security.ok){security.state=State::Unknown;return security;}}}auto r=LoadJournal(JournalPath(),j);return r.ok?Validate(j):r;}
+Result WindowsHost::Save(const Journal& j){auto r=Validate(j);return r.ok?SaveJournal(JournalPath(),j,options.storeRoot.empty()):r;}
 Result WindowsHost::Record(Journal& j,const std::string& action,bool complete){auto& list=complete?j.completed:j.intents;if(!Has(list,action))list.push_back(action);return Save(j);}
 Result WindowsHost::Capture(Journal& j,const std::wstring& path,const std::string& replacement,bool replacementExists) {
     auto safe=SafeParents(path);if(!safe.ok)return safe;
@@ -105,12 +145,16 @@ Result WindowsHost::Capture(Journal& j,const std::wstring& path,const std::strin
     auto index=j.files.size();f.backupPath=directory+L"\\"+Utf16(j.transactionId)+L"\\"+std::to_wstring(index)+L".bak";j.files.push_back(f);
     auto action="backup-"+std::to_string(index);r=Record(j,action,false);if(!r.ok)return r;
     r=SecureDirectory(Parent(f.backupPath),!options.storeRoot.empty());if(!r.ok)return r;
-    if(exists){r=AtomicWrite(f.backupPath,original);if(!r.ok)return r;std::string verify;bool found;r=ReadBytes(f.backupPath,verify,found);if(!r.ok || !found || Digest(verify)!=f.originalSha256)return Result::Bad("backup verification failed");}
+    if(exists){r=AtomicWrite(f.backupPath,original,options.storeRoot.empty());if(!r.ok)return r;std::string verify;bool found;r=ReadBytes(f.backupPath,verify,found);if(!r.ok || !found || Digest(verify)!=f.originalSha256)return Result::Bad("backup verification failed");}
     return Record(j,action,true);
 }
 Result WindowsHost::Initialize(Journal& j,Operation op) {
     try {
         auto r=Acquire(install);if(!r.ok)return r;
+        if(op!=Operation::Restore){
+            std::wstring game=install.canonicalBin+L"\\StarCitizen.exe";
+            for(auto* path:{&game,&options.launcher,&options.crashHandler}){r=CanonicalExecutable(*path);if(!r.ok)return r;}
+        }
         std::string bytes;bool exists=false;r=ReadBytes(JournalPath(),bytes,exists);if(!r.ok)return r;
         if(exists){r=Load(j);if(!r.ok)return r;if(op==Operation::Restore)return r;if(j.state==State::Modified){
             std::vector<uint32_t> peers;std::vector<uint16_t> ports;std::vector<RuleSpec> desired;
@@ -146,7 +190,8 @@ Result WindowsHost::Initialize(Journal& j,Operation op) {
             const std::string hostname="modules-cdn.eac-prod.on.epicgames.com";std::istringstream lines(hosts);std::string line;bool blocked=false;
             while(std::getline(lines,line)){line=line.substr(0,line.find('#'));std::istringstream words(line);std::string ip,name;words>>ip;while(words>>name)if(name==hostname){if(ip!="127.0.0.1" && ip!="0.0.0.0" && ip!="::1")return Result::Bad("conflicting EAC hosts mapping; isolation retained");blocked=true;}}
             if(!blocked){if(!hosts.empty() && hosts.back()!='\n')hosts+="\r\n";hosts+="127.0.0.1 "+hostname+" # sc-offline verified isolation\r\n";r=Capture(j,Hosts(),hosts,true);if(!r.ok)return r;}}
-        if(options.eacRename){std::string eac,bak;bool hasBak;r=ReadBytes(Eac()+L".bak",bak,hasBak);if(!r.ok || hasBak)return Result::Bad("existing EAC .bak conflicts with transaction; isolation retained");r=ReadBytes(Eac(),eac,found);if(!r.ok)return r;if(found){r=Capture(j,Eac(),"",false);if(!r.ok)return r;}}
+        {std::string bak;bool hasBak;r=ReadBytes(EacPath()+L".bak",bak,hasBak);if(!r.ok || hasBak){j.state=State::RecoveryRequired;auto saved=Record(j,"shared-eac-conflict",false);auto conflict=Result::Bad("existing EAC .bak conflicts with transaction; isolation retained");if(!saved.ok)conflict.issues.insert(conflict.issues.end(),saved.issues.begin(),saved.issues.end());return conflict;}}
+        if(options.eacRename){std::string eac;r=ReadBytes(EacPath(),eac,found);if(!r.ok)return r;if(found){r=Capture(j,EacPath(),"",false);if(!r.ok)return r;}}
         return Save(j);
     }catch(const std::exception& e){return Result::Bad(e.what());}
 }
@@ -163,6 +208,17 @@ Result WindowsHost::InspectProcesses() {
 }
 Result WindowsHost::EnsureIsolation(Journal& j){auto r=Validate(j);if(!r.ok)return r;r=Record(j,"ensure-rules",false);if(!r.ok)return r;r=EnsurePolicy(j.rules);return r.ok?Record(j,"ensure-rules",true):r;}
 Result WindowsHost::VerifyIsolation(const Journal& j){auto r=Validate(j);return r.ok?VerifyPolicy(j.rules):r;}
+Result WindowsHost::VerifyRecoveryEvidence(const Journal& j){
+    auto r=Validate(j);if(!r.ok)return r;
+    for(auto& f:j.files){
+        std::string bytes;bool exists;r=ReadBytes(f.path,bytes,exists);if(!r.ok)return r;
+        if(exists!=f.replacementExists || (exists && Digest(bytes)!=f.replacementSha256))return Result::Bad("installed recovery evidence changed: "+Utf8(f.path));
+        if(f.existed){r=ReadBytes(f.backupPath,bytes,exists);if(!r.ok || !exists || Digest(bytes)!=f.originalSha256)return Result::Bad("original recovery backup missing or changed: "+Utf8(f.backupPath));}
+    }
+    std::string bytes;bool exists;r=ReadBytes(EacPath()+L".bak",bytes,exists);
+    if(!r.ok || exists)return Result::Bad("unresolved shared EAC backup conflict; isolation retained");
+    return Result::Good(State::Modified);
+}
 Result WindowsHost::InstallFiles(Journal& j){
     for(size_t i=0;i<j.files.size();++i){auto& f=j.files[i];auto action="install-"+std::to_string(i);auto r=Record(j,action,false);if(!r.ok)return r;
         std::string current;bool exists;r=ReadBytes(f.path,current,exists);if(!r.ok)return r;if(exists!=f.existed || (exists && Digest(current)!=f.originalSha256))return Result::Bad("file changed before installation: "+Utf8(f.path));
@@ -185,6 +241,8 @@ Result WindowsHost::RestoreFiles(Journal& j){
 }
 Result WindowsHost::VerifyRestoration(const Journal& j){
     auto r=Validate(j);if(!r.ok)return r;
+    std::string eacBackup;bool hasEacBackup;r=ReadBytes(EacPath()+L".bak",eacBackup,hasEacBackup);
+    if(!r.ok || hasEacBackup)return Result::Bad("unresolved shared EAC backup conflict; isolation retained");
     for(auto& f:j.files){std::string bytes;bool exists;r=ReadBytes(f.path,bytes,exists);if(!r.ok)return r;if(exists!=f.existed || (exists && Digest(bytes)!=f.originalSha256))return Result::Bad("restoration hash/presence mismatch: "+Utf8(f.path));}
     std::string dll;bool exists;r=ReadBytes(install.canonicalBin+L"\\dinput8.dll",dll,exists);if(!r.ok)return r;if(exists)return Result::Bad("a loadable dinput8.dll remains; third-party files are preserved and isolation retained");
     for(auto path:{install.canonicalBin+L"\\sc-offline.installed",install.canonicalBin+L"\\dinput8.dll.sc-offline-backup",Parent(install.canonicalBin)+L"\\user\\client\\0\\default_1.xml.sc-offline-backup"}){std::string bytes;bool found;r=ReadBytes(path,bytes,found);if(!r.ok || found)return Result::Bad("unresolved legacy evidence: "+Utf8(path));}

@@ -51,6 +51,7 @@ public:
     virtual Result InspectProcesses() = 0;
     virtual Result EnsureIsolation(Journal&) = 0;
     virtual Result VerifyIsolation(const Journal&) = 0;
+    virtual Result VerifyRecoveryEvidence(const Journal&) = 0;
     virtual Result InstallFiles(Journal&) = 0;
     virtual Result RestoreFiles(Journal&) = 0;
     virtual Result VerifyRestoration(const Journal&) = 0;
