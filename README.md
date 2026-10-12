@@ -61,25 +61,18 @@ Don't copy anything into your game folder yourself.
 
 ### 2. What the launcher changes
 
-The mod can't run while Easy Anti-Cheat (EAC) is on, so each time you play, the launcher's helper:
+The helper establishes and verifies mandatory firewall isolation for the selected game, RSI Launcher, and CrashHandler before installing modified files. It records original files and shared EAC/hosts changes in an installation-specific protected journal. EAC executable originals use that recovery store rather than `.exe.bak` renames.
 
-| Step | Change | Why |
-| --- | --- | --- |
-| 1 | Adds a Windows Firewall rule that blocks `StarCitizen.exe` | The game has no network while modded |
-| 2 | Adds `127.0.0.1 modules-cdn.eac-prod.on.epicgames.com` to your hosts file | The RSI Launcher doesn't download EAC again |
-| 3 | Renames `EasyAntiCheat_EOS.exe` to `EasyAntiCheat_EOS.exe.bak` | EAC doesn't start |
+When controlled Play ends, the helper restores and verifies its recorded originals before removing its own rules. Failed restoration, missing backups, legacy conflicts, or failed verification retain isolation and report recovery required. Persistent Install retains both the mod and isolation; use controlled Play and then Uninstall. Multiplayer is off by default and requires explicit peers and UDP ports. See [launcher isolation and recovery](docs/launcher.md).
 
-When the game closes, it undoes exactly what it changed and prints what it undid. Anything you set up yourself is left alone. If the game crashes or the PC shuts down, the next run of `sc-offline.exe` lists what is still in place and offers to undo it. Each step can be turned off in `sc-offline.ini`; see [docs/launcher.md](docs/launcher.md#pc-changes).
-
-> [!IMPORTANT]
-> The firewall rule stops the game reaching the network. It doesn't remove other traces on your PC by itself. When the game closes, the launcher lists the logs the game wrote during this session (`Game.log`, new files in `logbackups` and `Crashes`) and asks twice before deleting them; keep `Game.log` if you want to report a bug. Older logs are never touched. Use the mod at your own risk.
+Play/install are disabled under Wine until a supported isolation adapter exists.
 
 ## Play
 
 Double-clicking `sc-offline.exe` opens its window:
 
 <p align="center">
-  <img src="images/launcher.png" alt="The sc-offline window: a green light saying it's safe to go online, buttons for Play, Status, Update, Install, Uninstall, Open settings and Open logs, and the output of Status (the previous window; this version's is drawn with Direct3D 11 and has a Plugins page)" width="85%">
+  <img src="images/launcher.png" alt="The sc-offline window: a historical status light, buttons for Play, Status, Update, Install, Uninstall, Open settings and Open logs, and the output of Status (the previous window; this version's is drawn with Direct3D 11 and has a Plugins page)" width="85%">
   <br><sub>The launcher after clicking <b>Status</b> (captured under Wine, hence the <code>Wine:</code> line).</sub>
 </p>
 
@@ -88,11 +81,11 @@ Double-clicking `sc-offline.exe` opens its window:
 | **Play** | `sc-offline.exe play`: add the mod, start the game, take the mod out when it closes |
 | **Status** | `sc-offline.exe status`: check the setup, change nothing |
 | **Update** | `sc-offline.exe update`: check GitHub for a newer sc-offline |
-| **Install** / **Uninstall** | `sc-offline.exe install` / `uninstall` |
+| **Install** / **Uninstall** | Persistent isolated installation / verified restoration of the recorded transaction |
 | **Settings** / **Logs** (top bar) | open `sc-offline.ini` in Notepad / the `data` folder |
 | **Plugins** (sidebar) | switch the plugins in `data\plugins` on or off and change their settings ([docs/launcher.md](docs/launcher.md#the-plugins-page)) |
 
-While you play, your Discord profile shows **Playing sc-offline** with the version you're running, where you are and your ship, plus buttons to this Discord and the download page (the `discord` plugin; switch **Discord** off in the top bar to hide it). The light at the top shows whether it's safe to go online. Questions (`Update now?`, `Delete these files?`) get **Yes** and **No** buttons. Every command still works from a terminal.
+While you play, your Discord profile shows **Playing sc-offline** with the version you're running, where you are and your ship, plus buttons to this Discord and the download page (the `discord` plugin; switch **Discord** off in the top bar to hide it). The status banner reports verified isolation, restoration of recorded changes, recovery required, or state unknown; it does not certify the complete official installation. Questions (`Update now?`, `Delete these files?`) get **Yes** and **No** buttons. Every command still works from a terminal.
 
 1. Close the RSI Launcher and the game.
 2. Double-click `sc-offline.exe` and click **Play**. The window shows the game folder it found. Windows asks for administrator rights; say yes. That prompt is for the small helper that makes the changes above and copies the mod in and out; the game itself never runs as administrator.

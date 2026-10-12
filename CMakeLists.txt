@@ -187,7 +187,7 @@ set_target_properties(imgui dinput8 PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELE
 # Console subsystem (CMake's default for an executable). No UAC setting: the manifest keeps the
 # linker default asInvoker; the launcher asks for administrator rights at run time
 # (ShellExecuteEx "runas") only for the parts that need them.
-add_executable(sc-offline launcher/launcher.cpp launcher/version.rc)
+add_executable(sc-offline launcher/launcher.cpp launcher/version.rc launcher/safety/transaction.cpp launcher/safety/journal.cpp launcher/safety/firewall.cpp launcher/safety/windows_host.cpp)
 # Version resource (Properties > Details): src/version.rc, shared with dinput8.dll.
 # sc-offline.exe gets its own .rc so the two targets can define SCO_RC_EXE differently.
 target_compile_definitions(sc-offline PRIVATE ${SCO_COMMON_DEFINES})
@@ -195,7 +195,7 @@ target_compile_options(sc-offline PRIVATE ${SCO_COMMON_OPTIONS} /W3)
 # The window is ImGui on Direct3D 11 (the imgui target above; its INTERFACE libs bring d3d11 and dwmapi), and
 # the Plugins page edits a plugin's [settings] in its sco.storage database through sco-core's vendored
 # SQLite (sco_sqlite). The system libraries are also named by #pragma comment(lib) in launcher.cpp.
-target_link_libraries(sc-offline PRIVATE imgui sco_sqlite bcrypt shell32 shlwapi advapi32 ole32 winhttp user32 gdi32 comctl32)
+target_link_libraries(sc-offline PRIVATE imgui sco_sqlite bcrypt shell32 shlwapi advapi32 ole32 oleaut32 ws2_32 winhttp user32 gdi32 comctl32)
 
 # --- test plugins (CI artifact "test-plugins"; never part of a release) ---------------------------
 # spawn_probe exercises the spawn built-in's command and service, and the teleport built-in's
